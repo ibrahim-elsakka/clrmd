@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 
 namespace Microsoft.Diagnostics.Runtime.Native
 {
@@ -111,6 +112,15 @@ namespace Microsoft.Diagnostics.Runtime.Native
 
         }
 
+        protected override MemoryReader GetMemoryReaderForAddress(ulong obj)
+        {
+            var cache = MemoryReader;
+            if (!cache.Contains(obj))
+                cache = NativeRuntime.MemoryReader;
+
+            return cache;
+        }
+
         public override bool TryGetMethodTable(ulong obj, out ulong methodTable, out ulong componentMethodTable)
         {
             throw new NotImplementedException();
@@ -123,6 +133,10 @@ namespace Microsoft.Diagnostics.Runtime.Native
                 return NativeRuntime;
             }
         }
+
+        public override ClrRootStackwalkPolicy StackwalkPolicy { get => throw new NotImplementedException(); set => throw new NotImplementedException(); }
+
+        public override bool AreRootsCached => false;
 
         public override ClrType GetTypeByMethodTable(ulong methodTable, ulong componentMethodTable)
         {
@@ -329,6 +343,16 @@ namespace Microsoft.Diagnostics.Runtime.Native
         protected override int GetRuntimeRevision()
         {
             return 0;
+        }
+
+        public override void CacheRoots(CancellationToken cancelToken)
+        {
+            throw new NotImplementedException();
+        }
+
+        public override void ClearRootCache()
+        {
+            throw new NotImplementedException();
         }
     }
 

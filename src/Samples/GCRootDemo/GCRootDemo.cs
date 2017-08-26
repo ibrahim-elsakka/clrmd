@@ -46,20 +46,20 @@ namespace GCRootDemo
                 /* Since GCRoot can take a long time to run, ClrMD provides an event to get progress updates on how far
                  * along GCRoot is.  There are some caveats here, in that you only get updates if you have cached the
                  * gc heap locally (more on that later).  This is because without pre-fetching and compiling data ahead
-                 * of time, we have no real way to know how big the heap is.  The intent of this delegate is to allow
-                 * you to report to the user a rough percentage of how far along things are (such as a progress bar or
-                 * console output).
+                 * of time, we have no real way to know how many objects are on the heap.  The intent of this delegate is
+                 * to allow you to report to the user a rough percentage of how far along things are (such as a progress
+                 * bar or console output).
                  */
-                gcroot.ProgressUpdate += delegate (GCRoot source, GCRootPhase phase, long current, long total)
+                gcroot.ProgressUpdate += delegate (GCRoot source, long current, long total)
                 {
                     // Note that sometimes we don't know how many total items will be processed in the current
                     // phase.  In that case, total will be -1.  (For example, we don't know the total number
                     // of handles on the handle table until we enumerate them all.)
 
                     if (total > 0)
-                        Console.WriteLine($"phase={phase} completed={(int)(100 * current / (float)total)}%");
+                        Console.WriteLine($"heap searched={(int)(100 * current / (float)total)}%");
                     else
-                        Console.WriteLine($"phase={phase} completed items in phase={current}");
+                        Console.WriteLine($"objects inspected={current}");
                 };
 
                 // ==========================================
@@ -76,22 +76,19 @@ namespace GCRootDemo
                 try
                 {
                     gcroot.BuildCache(CancellationToken.None);
+                    // Now GCRoot will run MUCH, MUCH faster for the following code.
                 }
-                catch (GCRootCacheException ex) // This inherits from OutOfMemoryException
+                catch (OutOfMemoryException)
                 {
-                    // Whoops, the crash dump in question was too big to read all data into memory.  We will try again
-                    // but not try to cache the whole heap.  GCRootCacheException tells you how many objects we got to
-                    // before running oom, so we will try again with 1/3 the count.  You should wrap this in a try/catch
-                    // as well, but omitted here for brevity.
-                    gcroot.BuildCache(ex.CompletedObjects / 3, CancellationToken.None);
+                    // Whoops, the crash dump in question was too big to read all data into memory.  We will continue
+                    // on without cached GC data.
                 }
 
-                // Now GCRoot will run MUCH, MUCH faster for the following code.
 
                 // ==========================================
 
                 /* The next thing to know about GCRoot is there are two ways we can walk the stack of threads looking for
-                 * roots:  Exact and Fast.  You change this setting with GCRoot.StackwalkPolicy.  Using a stackwalk policy
+                 * roots:  Exact and Fast.  You change this setting with ClrHeap.StackwalkPolicy.  Using a stackwalk policy
                  * of exact will show you exactly what the GC sees, eliminating false roots, but it can be slow.  Using the
                  * Fast stackwalk policy is very fast, but can over-report roots that are actually just old GC references
                  * left on the stack.
@@ -100,9 +97,9 @@ namespace GCRootDemo
                  * to use.  Lastly, note that you can choose to omit stack roots entirely by setting StackwalkPolicy to
                  * "SkipStack".
                  */
-                
+
                 // Let's set a concrete example:
-                gcroot.StackwalkPolicy = GCRootStackWalkPolicy.Exact;
+                heap.StackwalkPolicy = ClrRootStackwalkPolicy.Exact;
 
 
                 // ==========================================

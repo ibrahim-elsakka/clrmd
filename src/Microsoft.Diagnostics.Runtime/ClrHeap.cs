@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using Microsoft.Diagnostics.Runtime.Desktop;
+using System.Threading;
 
 namespace Microsoft.Diagnostics.Runtime
 {
@@ -15,7 +16,8 @@ namespace Microsoft.Diagnostics.Runtime
     public abstract class ClrHeap
     {
         /// <summary>
-        /// And the ability to take an address of an object and fetch its type (The type alows further exploration)
+        /// Obtains the type of an object at the given address.  Returns null if objRef does not point to
+        /// a valid managed object.
         /// </summary>
         abstract public ClrType GetObjectType(ulong objRef);
 
@@ -90,6 +92,49 @@ namespace Microsoft.Diagnostics.Runtime
         /// Equivalent to EnumerateRoots(true).
         /// </summary>
         abstract public IEnumerable<ClrRoot> EnumerateRoots();
+
+        /// <summary>
+        /// Sets the stackwalk policy for enumerating roots.  See ClrRootStackwalkPolicy for more information.
+        /// Setting this field can invalidate the root cache.
+        /// <see cref="ClrRootStackwalkPolicy"/>
+        /// </summary>
+        abstract public ClrRootStackwalkPolicy StackwalkPolicy { get; set; }
+
+        /// <summary>
+        /// Caches all relevant heap information into memory so future heap operations run faster and
+        /// do not require touching the debuggee.
+        /// </summary>
+        /// <param name="cancelToken">A cancellation token to stop caching the heap.</param>
+        virtual public void CacheHeap(CancellationToken cancelToken) => throw new NotImplementedException();
+
+        /// <summary>
+        /// Releases all cached object data to reclaim memory.
+        /// </summary>
+        virtual public void ClearHeapCache() => throw new NotImplementedException();
+
+        /// <summary>
+        /// Returns true if the heap is cached, false otherwise.
+        /// </summary>
+        virtual public bool IsHeapCached { get => false; }
+
+        /// <summary>
+        /// Returns whether the roots of the process are cached or not.
+        /// </summary>
+        abstract public bool AreRootsCached { get; }
+
+        /// <summary>
+        /// This method caches many roots so that subsequent calls to EnumerateRoots run faster.
+        /// </summary>
+        abstract public void CacheRoots(CancellationToken cancelToken);
+
+        virtual internal void BuildDependentHandleMap(CancellationToken cancelToken) { }
+        virtual internal IEnumerable<ClrRoot> EnumerateStackRoots() => throw new NotImplementedException();
+        virtual internal IEnumerable<ClrHandle> EnumerateStrongHandles() => throw new NotImplementedException();
+
+        /// <summary>
+        /// This method clears any previously cached roots to reclaim memory.
+        /// </summary>
+        abstract public void ClearRootCache();
 
         /// <summary>
         /// Looks up a type by name.
@@ -169,6 +214,12 @@ namespace Microsoft.Diagnostics.Runtime
         abstract public IEnumerable<ulong> EnumerateObjectAddresses();
 
         /// <summary>
+        /// Enumerates all objects on the heap.
+        /// </summary>
+        /// <returns>An enumerator for all objects on the heap.</returns>
+        abstract public IEnumerable<ClrObject> EnumerateObjects();
+
+        /// <summary>
         /// TotalHeapSize is defined as the sum of the length of all segments.  
         /// </summary>
         abstract public ulong TotalHeapSize { get; }
@@ -244,6 +295,49 @@ namespace Microsoft.Diagnostics.Runtime
         /// <param name="value">The pointer value.</param>
         /// <returns>True if we successfully read the value, false if addr is not mapped into the process space.</returns>
         public abstract bool ReadPointer(ulong addr, out ulong value);
+
+        internal abstract IEnumerable<ClrObject> EnumerateObjectReferences(ulong obj, ClrType type, bool carefully);
+        internal abstract void EnumerateObjectReferences(ulong obj, ClrType type, bool carefully, Action<ulong, int> callback);
+
+        /// <summary>
+        /// This might be useful to be public, but we actually don't know the total number objects without walking the entire
+        /// heap.  This property is only valid if we have cached the heap...which leads to a weird programatic interface (that
+        /// this simply property would throw InvalidOperationException unless the heap is cached).  I'm leaving this internal
+        /// until I am convinced there's a good way to surface this.
+        /// </summary>
+        internal virtual long TotalObjects { get => -1; }
+    }
+
+    /// <summary>
+    /// This sets the policy for how ClrHeap walks the stack when enumerating roots.  There is a choice here because the 'Exact' stack walking
+    /// gives the correct answer (without overreporting), but unfortunately is poorly implemented in CLR's debugging layer.
+    /// This means it could take 10-30 minutes (!) to enumerate roots on crash dumps with 4000+ threads.
+    /// </summary>
+    public enum ClrRootStackwalkPolicy
+    {
+        /// <summary>
+        /// The GCRoot class will attempt to select a policy for you based on the number of threads in the process.
+        /// </summary>
+        Automatic,
+
+        /// <summary>
+        /// Use real stack roots.  This is much slower than 'Fast', but provides no false-positives for more accurate
+        /// results.  Note that this can actually take 10s of minutes to enumerate the roots themselves in the worst
+        /// case scenario.
+        /// </summary>
+        Exact,
+
+        /// <summary>
+        /// Walks each pointer alighed address on all stacks and if it points to an object it treats that location
+        /// as a real root.  This can over-report roots when a value is left on the stack, but the GC does not
+        /// consider it a real root.
+        /// </summary>
+        Fast,
+
+        /// <summary>
+        /// Do not walk stack roots.
+        /// </summary>
+        SkipStack,
     }
 
     /// <summary>
@@ -467,17 +561,30 @@ namespace Microsoft.Diagnostics.Runtime
         virtual public ulong CommittedEnd { get { return 0; } }
 
         /// <summary>
-        /// If it is possible to move from one object to the 'next' object in the segment. 
-        /// Then FirstObject returns the first object in the heap (or null if it is not
-        /// possible to walk the heap.
+        /// FirstObject returns the first object on this segment or 0 if this segment contains no objects.
         /// </summary>
-        virtual public ulong FirstObject { get { return 0; } }
+        abstract public ulong FirstObject { get; }
+
+        /// <summary>
+        /// FirstObject returns the first object on this segment or 0 if this segment contains no objects.
+        /// </summary>
+        /// <param name="type">The type of the first object.</param>
+        /// <returns>The first object on this segment or 0 if this segment contains no objects.</returns>
+        abstract public ulong GetFirstObject(out ClrType type);
+
 
         /// <summary>
         /// Given an object on the segment, return the 'next' object in the segment.  Returns
         /// 0 when there are no more objects.   (Or enumeration is not possible)  
         /// </summary>
-        virtual public ulong NextObject(ulong objRef) { return 0; }
+        abstract public ulong NextObject(ulong objRef);
+
+        /// <summary>
+        /// Given an object on the segment, return the 'next' object in the segment.  Returns
+        /// 0 when there are no more objects.   (Or enumeration is not possible)  
+        /// </summary>
+        abstract public ulong NextObject(ulong objRef, out ClrType type);
+
 
         /// <summary>
         /// Returns true if this is a segment for the Large Object Heap.  False otherwise.
@@ -669,6 +776,7 @@ namespace Microsoft.Diagnostics.Runtime
 
     internal abstract class HeapBase : ClrHeap
     {
+        static protected readonly ClrObject[] s_emptyObjectSet = new ClrObject[0];
         private ulong _minAddr;          // Smallest and largest segment in the GC heap.  Used to make SegmentForObject faster.  
         private ulong _maxAddr;
         private ClrSegment[] _segments;
@@ -835,6 +943,22 @@ namespace Microsoft.Diagnostics.Runtime
             }
         }
 
+        public override IEnumerable<ClrObject> EnumerateObjects()
+        {
+            if (Revision != GetRuntimeRevision())
+                ClrDiagnosticsException.ThrowRevisionError(Revision, GetRuntimeRevision());
+
+            for (int i = 0; i < _segments.Length; ++i)
+            {
+                ClrSegment seg = _segments[i];
+                
+                for (ulong obj = seg.GetFirstObject(out ClrType type); obj != 0; obj = seg.NextObject(obj, out type))
+                {
+                    _lastSegmentIdx = i;
+                    yield return ClrObject.Create(obj, type);
+                }
+            }
+        }
 
         public override IEnumerable<ulong> EnumerateObjectAddresses()
         {
@@ -843,7 +967,7 @@ namespace Microsoft.Diagnostics.Runtime
 
             for (int i = 0; i < _segments.Length; ++i)
             {
-                var seg = _segments[i];
+                ClrSegment seg = _segments[i];
                 for (ulong obj = seg.FirstObject; obj != 0; obj = seg.NextObject(obj))
                 {
                     _lastSegmentIdx = i;
@@ -882,6 +1006,60 @@ namespace Microsoft.Diagnostics.Runtime
             }
             return null;
         }
+
+        internal override IEnumerable<ClrObject> EnumerateObjectReferences(ulong obj, ClrType type, bool carefully)
+        {
+            if (type == null)
+                type = GetObjectType(obj);
+            else
+                Debug.Assert(type == GetObjectType(obj));
+
+            if (!type.ContainsPointers)
+                return s_emptyObjectSet;
+
+            GCDesc gcdesc = type.GCDesc;
+            if (gcdesc == null)
+                return s_emptyObjectSet;
+
+            ulong size = type.GetSize(obj);
+            if (carefully)
+            {
+                ClrSegment seg = GetSegmentByAddress(obj);
+                if (seg == null || obj + size > seg.End || (!seg.IsLarge && size > 85000))
+                    return s_emptyObjectSet;
+            }
+
+            List<ClrObject> result = new List<ClrObject>();
+            gcdesc.WalkObject(obj, size, GetMemoryReaderForAddress(obj), (reference, offset) => result.Add(new ClrObject(reference, GetObjectType(reference))));
+            return result;
+        }
+
+        internal override void EnumerateObjectReferences(ulong obj, ClrType type, bool carefully, Action<ulong, int> callback)
+        {
+            if (type == null)
+                type = GetObjectType(obj);
+            else
+                Debug.Assert(type == GetObjectType(obj));
+
+            if (!type.ContainsPointers)
+                return;
+
+            GCDesc gcdesc = type.GCDesc;
+            if (gcdesc == null)
+                return;
+
+            ulong size = type.GetSize(obj);
+            if (carefully)
+            {
+                ClrSegment seg = GetSegmentByAddress(obj);
+                if (seg == null || obj + size > seg.End || (!seg.IsLarge && size > 85000))
+                    return;
+            }
+
+            gcdesc.WalkObject(obj, size, GetMemoryReaderForAddress(obj), callback);
+        }
+
+        protected abstract MemoryReader GetMemoryReaderForAddress(ulong obj);
     }
 
 
@@ -936,54 +1114,129 @@ namespace Microsoft.Diagnostics.Runtime
         {
             get
             {
-                if (Gen2Start == End)
+                ulong start = Gen2Start;
+                if (start >= End)
                     return 0;
-                _heap.MemoryReader.EnsureRangeInCache(Gen2Start);
-                return Gen2Start;
+
+                _heap.MemoryReader.EnsureRangeInCache(start);
+                return start;
             }
         }
 
-        public override ulong NextObject(ulong addr)
+        public override ulong GetFirstObject(out ClrType type)
         {
-            if (addr >= CommittedEnd)
+            ulong start = Gen2Start;
+            if (start >= End)
+            {
+                type = null;
+                return 0;
+            }
+
+            _heap.MemoryReader.EnsureRangeInCache(start);
+            type = _heap.GetObjectType(start);
+            return start;
+        }
+
+        public override ulong NextObject(ulong objRef)
+        {
+            if (objRef >= CommittedEnd)
                 return 0;
 
             uint minObjSize = (uint)_clr.PointerSize * 3;
 
-            ClrType type = _heap.GetObjectType(addr);
-            if (type == null)
+            ClrType currType = _heap.GetObjectType(objRef);
+            if (currType == null)
                 return 0;
 
-            ulong size = type.GetSize(addr);
+            ulong size = currType.GetSize(objRef);
             size = Align(size, _large);
             if (size < minObjSize)
                 size = minObjSize;
 
             // Move to the next object
-            addr += size;
+            objRef += size;
 
             // Check to make sure a GC didn't cause "count" to be invalid, leading to too large
             // of an object
-            if (addr >= End)
+            if (objRef >= End)
                 return 0;
 
             // Ensure we aren't at the start of an alloc context
-            while (!IsLarge && _subHeap.AllocPointers.TryGetValue(addr, out ulong tmp))
+            while (!IsLarge && _subHeap.AllocPointers.TryGetValue(objRef, out ulong tmp))
             {
                 tmp += Align(minObjSize, _large);
 
                 // Only if there's data corruption:
-                if (addr >= tmp)
+                if (objRef >= tmp)
                     return 0;
 
                 // Otherwise:
-                addr = tmp;
+                objRef = tmp;
 
-                if (addr >= End)
+                if (objRef >= End)
                     return 0;
             }
+            
+            return objRef;
+        }
 
-            return addr;
+        public override ulong NextObject(ulong objRef, out ClrType type)
+        {
+            if (objRef >= CommittedEnd)
+            {
+                type = null;
+                return 0;
+            }
+
+            uint minObjSize = (uint)_clr.PointerSize * 3;
+
+            ClrType currType = _heap.GetObjectType(objRef);
+            if (currType == null)
+            {
+                type = null;
+                return 0;
+            }
+
+            ulong size = currType.GetSize(objRef);
+            size = Align(size, _large);
+            if (size < minObjSize)
+                size = minObjSize;
+
+            // Move to the next object
+            objRef += size;
+
+            // Check to make sure a GC didn't cause "count" to be invalid, leading to too large
+            // of an object
+            if (objRef >= End)
+            {
+                type = null;
+                return 0;
+            }
+
+            // Ensure we aren't at the start of an alloc context
+            while (!IsLarge && _subHeap.AllocPointers.TryGetValue(objRef, out ulong tmp))
+            {
+                tmp += Align(minObjSize, _large);
+
+                // Only if there's data corruption:
+                if (objRef >= tmp)
+                {
+                    type = null;
+                    return 0;
+                }
+
+                // Otherwise:
+                objRef = tmp;
+
+                if (objRef >= End)
+                {
+                    type = null;
+                    return 0;
+                }
+            }
+
+            type = _heap.GetObjectType(objRef);
+            return objRef;
         }
 
         #region private

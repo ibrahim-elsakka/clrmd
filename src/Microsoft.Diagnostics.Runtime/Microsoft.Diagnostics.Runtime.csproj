@@ -22,7 +22,7 @@
     <DebugType>full</DebugType>
     <Optimize>false</Optimize>
     <OutputPath>bin\Debug\</OutputPath>
-    <DefineConstants>TRACE;DEBUG;_REDHAWK</DefineConstants>
+    <DefineConstants>TRACE;DEBUG</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -34,7 +34,7 @@
     <DebugType>pdbonly</DebugType>
     <Optimize>true</Optimize>
     <OutputPath>bin\Release\</OutputPath>
-    <DefineConstants>TRACE;_REDHAWK</DefineConstants>
+    <DefineConstants>TRACE</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
@@ -53,6 +53,7 @@
   <ItemGroup>
     <Compile Include="ClrAppDomain.cs" />
     <Compile Include="ClrObject.cs" />
+    <Compile Include="ClrValueClass.cs" />
     <Compile Include="DataTarget.cs" />
     <Compile Include="Debugger\Enums.cs" />
     <Compile Include="Debugger\IDebugAdvanced.cs" />
@@ -115,7 +116,6 @@
     <Compile Include="ClrModule.cs" />
     <Compile Include="DumpDataReader.cs" />
     <Compile Include="ClrHeap.cs" />
-    <Compile Include="GCCache.cs" />
     <Compile Include="GCRoot.cs" />
     <Compile Include="ICorDebug\ICorDebugHelpers.cs" />
     <Compile Include="ICorDebug\ICorDebugWrappers.cs" />
@@ -168,7 +168,6 @@
     <Compile Include="Utilities\SymbolLocator.cs" />
     <Compile Include="Utilities\SymbolPath.cs" />
   </ItemGroup>
-  <ItemGroup />
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 
        Other similar extension points exist, see Microsoft.Common.targets.

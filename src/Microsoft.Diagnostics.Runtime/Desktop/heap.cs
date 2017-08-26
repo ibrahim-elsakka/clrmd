@@ -4,7 +4,9 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Text;
+using System.Threading;
 
 namespace Microsoft.Diagnostics.Runtime.Desktop
 {
@@ -18,17 +20,42 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             Revision = runtime.Revision;
 
             // Prepopulate a few important method tables.
-            _free = GetTypeByMethodTable(DesktopRuntime.FreeMethodTable, 0, 0);
-            ((DesktopHeapType)Free).Shared = true;
-            ObjectType = GetTypeByMethodTable(DesktopRuntime.ObjectMethodTable, 0, 0);
-            ArrayType = GetTypeByMethodTable(DesktopRuntime.ArrayMethodTable, DesktopRuntime.ObjectMethodTable, 0);
-            ArrayType.ComponentType =  ObjectType;
-            ((BaseDesktopHeapType)Free).DesktopModule = (DesktopModule)ObjectType.Module;
-            StringType = GetTypeByMethodTable(DesktopRuntime.StringMethodTable, 0, 0);
-            ExceptionType = GetTypeByMethodTable(DesktopRuntime.ExceptionMethodTable, 0, 0);
+            _arrayType = new Lazy<ClrType>(CreateArrayType);
+            _exceptionType = new Lazy<ClrType>(() => GetTypeByMethodTable(DesktopRuntime.ExceptionMethodTable, 0, 0));
             ErrorType = new ErrorType(this);
 
+            StringType = DesktopRuntime.StringMethodTable != 0 ? GetTypeByMethodTable(DesktopRuntime.StringMethodTable, 0, 0) : ErrorType;
+            ObjectType = DesktopRuntime.ObjectMethodTable != 0 ? GetTypeByMethodTable(DesktopRuntime.ObjectMethodTable, 0, 0) : ErrorType;
+            if (DesktopRuntime.FreeMethodTable != 0)
+            {
+                var free = GetTypeByMethodTable(DesktopRuntime.FreeMethodTable, 0, 0);
+
+                ((DesktopHeapType)free).Shared = true;
+                ((BaseDesktopHeapType)free).DesktopModule = ObjectType.Module as DesktopModule;
+                _free = free;
+            }
+            else
+            {
+                _free = ErrorType;
+            }
+
             InitSegments(runtime);
+        }
+
+        private ClrType CreateFree()
+        {
+            var free = GetTypeByMethodTable(DesktopRuntime.FreeMethodTable, 0, 0);
+
+            ((DesktopHeapType)free).Shared = true;
+            ((BaseDesktopHeapType)free).DesktopModule = (DesktopModule)ObjectType.Module;
+            return free;
+        }
+
+        private ClrType CreateArrayType()
+        {
+            ClrType type = GetTypeByMethodTable(DesktopRuntime.ArrayMethodTable, DesktopRuntime.ObjectMethodTable, 0);
+            type.ComponentType = ObjectType;
+            return type;
         }
 
         protected override int GetRuntimeRevision()
@@ -93,6 +120,14 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return true;
         }
 
+        protected override MemoryReader GetMemoryReaderForAddress(ulong obj)
+        {
+            if (MemoryReader.Contains(obj))
+                return MemoryReader;
+
+            return DesktopRuntime.MemoryReader;
+        }
+
 
         internal ClrType GetGCHeapTypeFromModuleAndToken(ulong moduleAddr, uint token)
         {
@@ -117,7 +152,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
             return null;
         }
-        
+
         internal abstract ClrType GetTypeByMethodTable(ulong mt, ulong cmt, ulong obj);
 
 
@@ -212,6 +247,195 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             _managedLocks = li.InitLockInspection();
         }
 
+        public override ClrRootStackwalkPolicy StackwalkPolicy
+        {
+            get => _stackwalkPolicy;
+            set
+            {
+                if (value != _currentStackCache)
+                    _stackCache = null;
+
+                _stackwalkPolicy = value;
+            }
+        }
+
+        private ClrRootStackwalkPolicy _stackwalkPolicy;
+        private ClrRootStackwalkPolicy _currentStackCache = ClrRootStackwalkPolicy.SkipStack;
+        private Dictionary<ClrThread, ClrRoot[]> _stackCache;
+        private ClrHandle[] _strongHandles;
+        private Dictionary<ulong, List<ulong>> _dependentHandles;
+        
+        public override void CacheRoots(CancellationToken cancelToken)
+        {
+            if (StackwalkPolicy != ClrRootStackwalkPolicy.SkipStack && (_stackCache == null || _currentStackCache != StackwalkPolicy))
+            {
+                var cache = new Dictionary<ClrThread, ClrRoot[]>();
+
+                bool exactStackwalk = ClrThread.GetExactPolicy(Runtime, StackwalkPolicy);
+                foreach (ClrThread thread in Runtime.Threads)
+                {
+                    cancelToken.ThrowIfCancellationRequested();
+                    if (thread.IsAlive)
+                        cache.Add(thread, thread.EnumerateStackObjects(!exactStackwalk).ToArray());
+                }
+
+                _stackCache = cache;
+                _currentStackCache = StackwalkPolicy;
+            }
+
+            if (_strongHandles == null)
+                CacheStrongHandles(cancelToken);
+        }
+
+        private void CacheStrongHandles(CancellationToken cancelToken)
+        {
+            _strongHandles = EnumerateStrongHandlesWorker(cancelToken).OrderBy(k => GetHandleOrder(k.HandleType)).ToArray();
+            Debug.Assert(_dependentHandles != null);
+        }
+
+        public override void ClearRootCache()
+        {
+            _currentStackCache = ClrRootStackwalkPolicy.SkipStack;
+            _stackCache = null;
+            _strongHandles = null;
+            _dependentHandles = null;
+        }
+
+        public override bool AreRootsCached => (_stackwalkPolicy == ClrRootStackwalkPolicy.SkipStack || (_stackCache != null && _currentStackCache == StackwalkPolicy)) && _strongHandles != null;
+
+        private static int GetHandleOrder(HandleType handleType)
+        {
+            switch (handleType)
+            {
+                case HandleType.AsyncPinned:
+                    return 0;
+
+                case HandleType.Pinned:
+                    return 1;
+
+                case HandleType.Strong:
+                    return 2;
+
+                case HandleType.RefCount:
+                    return 3;
+
+                default:
+                    return 4;
+            }
+        }
+
+        internal override IEnumerable<ClrHandle> EnumerateStrongHandles()
+        {
+            if (_strongHandles != null)
+            {
+                Debug.Assert(_dependentHandles != null);
+                return _strongHandles;
+            }
+
+            return EnumerateStrongHandlesWorker(CancellationToken.None);
+        }
+
+        internal override void BuildDependentHandleMap(CancellationToken cancelToken)
+        {
+            if (_dependentHandles != null)
+                return;
+
+            _dependentHandles = DesktopRuntime.GetDependentHandleMap(cancelToken);
+        }
+
+        private IEnumerable<ClrHandle> EnumerateStrongHandlesWorker(CancellationToken cancelToken)
+        {
+            Dictionary<ulong, List<ulong>> dependentHandles = null;
+            if (_dependentHandles == null)
+                dependentHandles = new Dictionary<ulong, List<ulong>>();
+
+            foreach (ClrHandle handle in Runtime.EnumerateHandles())
+            {
+                cancelToken.ThrowIfCancellationRequested();
+
+                if (handle.Object != 0)
+                {
+                    switch (handle.HandleType)
+                    {
+                        case HandleType.RefCount:
+                            if (handle.RefCount > 0)
+                                yield return handle;
+
+                            break;
+
+                        case HandleType.AsyncPinned:
+                        case HandleType.Pinned:
+                        case HandleType.SizedRef:
+                        case HandleType.Strong:
+                            yield return handle;
+                            break;
+
+                        case HandleType.Dependent:
+                            if (dependentHandles != null)
+                            {
+                                if (!dependentHandles.TryGetValue(handle.Object, out List<ulong> list))
+                                    dependentHandles[handle.Object] = list = new List<ulong>();
+
+                                list.Add(handle.DependentTarget);
+                            }
+
+                            break;
+
+                        default:
+                            break;
+                    }
+                }
+            }
+
+            if (dependentHandles != null)
+                _dependentHandles = dependentHandles;
+        }
+
+        internal override IEnumerable<ClrRoot> EnumerateStackRoots()
+        {
+            if (StackwalkPolicy != ClrRootStackwalkPolicy.SkipStack)
+            {
+                if (_stackCache != null && _currentStackCache == StackwalkPolicy)
+                {
+                    return _stackCache.SelectMany(t => t.Value);
+                }
+                else
+                {
+                    return EnumerateStackRootsWorker();
+                }
+            }
+            
+            return new ClrRoot[0];
+        }
+
+        private IEnumerable<ClrRoot> EnumerateStackRootsWorker()
+        {
+            bool exactStackwalk = ClrThread.GetExactPolicy(Runtime, StackwalkPolicy);
+            foreach (ClrThread thread in DesktopRuntime.Threads)
+            {
+                if (thread.IsAlive)
+                {
+                    if (exactStackwalk)
+                    {
+                        foreach (var root in thread.EnumerateStackObjects(false))
+                            yield return root;
+                    }
+                    else
+                    {
+                        HashSet<ulong> seen = new HashSet<ulong>();
+                        foreach (var root in thread.EnumerateStackObjects(true))
+                        {
+                            if (!seen.Contains(root.Object))
+                            {
+                                seen.Add(root.Object);
+                                yield return root;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         public override IEnumerable<ClrRoot> EnumerateRoots()
         {
             return EnumerateRoots(true);
@@ -280,99 +504,86 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
 
             // Handles
-            var handles = DesktopRuntime.EnumerateHandles();
-            if (handles != null)
+            foreach (ClrHandle handle in EnumerateStrongHandles())
             {
-                foreach (ClrHandle handle in handles)
+                ulong objAddr = handle.Object;
+                GCRootKind kind = GCRootKind.Strong;
+                if (objAddr != 0)
                 {
-                    ulong objAddr = handle.Object;
-                    GCRootKind kind = GCRootKind.Strong;
-                    if (objAddr != 0)
+                    ClrType type = GetObjectType(objAddr);
+                    if (type != null)
                     {
-                        ClrType type = GetObjectType(objAddr);
-                        if (type != null)
+                        switch (handle.HandleType)
                         {
-                            switch (handle.HandleType)
-                            {
-                                case HandleType.WeakShort:
-                                case HandleType.WeakLong:
+                            case HandleType.WeakShort:
+                            case HandleType.WeakLong:
+                                break;
+                            case HandleType.RefCount:
+                                if (handle.RefCount <= 0)
                                     break;
-                                case HandleType.RefCount:
-                                    if (handle.RefCount <= 0)
-                                        break;
-                                    goto case HandleType.Strong;
-                                case HandleType.Dependent:
-                                    if (objAddr == 0)
-                                        continue;
-                                    objAddr = handle.DependentTarget;
-                                    goto case HandleType.Strong;
-                                case HandleType.Pinned:
-                                    kind = GCRootKind.Pinning;
-                                    goto case HandleType.Strong;
-                                case HandleType.AsyncPinned:
-                                    kind = GCRootKind.AsyncPinning;
-                                    goto case HandleType.Strong;
-                                case HandleType.Strong:
-                                case HandleType.SizedRef:
-                                    yield return new HandleRoot(handle.Address, objAddr, type, handle.HandleType, kind, handle.AppDomain);
+                                goto case HandleType.Strong;
+                            case HandleType.Pinned:
+                                kind = GCRootKind.Pinning;
+                                goto case HandleType.Strong;
+                            case HandleType.AsyncPinned:
+                                kind = GCRootKind.AsyncPinning;
+                                goto case HandleType.Strong;
+                            case HandleType.Strong:
+                            case HandleType.SizedRef:
+                                yield return new HandleRoot(handle.Address, objAddr, type, handle.HandleType, kind, handle.AppDomain);
 
-                                    // Async pinned handles keep 1 or more "sub objects" alive.  I will report them here as their own pinned handle.
-                                    if (handle.HandleType == HandleType.AsyncPinned)
+                                // Async pinned handles keep 1 or more "sub objects" alive.  I will report them here as their own pinned handle.
+                                if (handle.HandleType == HandleType.AsyncPinned)
+                                {
+                                    ClrInstanceField userObjectField = type.GetFieldByName("m_userObject");
+                                    if (userObjectField != null)
                                     {
-                                        ClrInstanceField userObjectField = type.GetFieldByName("m_userObject");
-                                        if (userObjectField != null)
+                                        ulong _userObjAddr = userObjectField.GetAddress(objAddr);
+                                        ulong _userObj = (ulong)userObjectField.GetValue(objAddr);
+                                        var _userObjType = GetObjectType(_userObj);
+                                        if (_userObjType != null)
                                         {
-                                            ulong _userObjAddr = userObjectField.GetAddress(objAddr);
-                                            ulong _userObj = (ulong)userObjectField.GetValue(objAddr);
-                                            var _userObjType = GetObjectType(_userObj);
-                                            if (_userObjType != null)
+                                            if (_userObjType.IsArray)
                                             {
-                                                if (_userObjType.IsArray)
+                                                if (_userObjType.ComponentType != null)
                                                 {
-                                                    if (_userObjType.ComponentType != null)
+                                                    if (_userObjType.ComponentType.ElementType == ClrElementType.Object)
                                                     {
-                                                        if (_userObjType.ComponentType.ElementType == ClrElementType.Object)
+                                                        // report elements
+                                                        int len = _userObjType.GetArrayLength(_userObj);
+                                                        for (int i = 0; i < len; ++i)
                                                         {
-                                                            // report elements
-                                                            int len = _userObjType.GetArrayLength(_userObj);
-                                                            for (int i = 0; i < len; ++i)
-                                                            {
-                                                                ulong indexAddr = _userObjType.GetArrayElementAddress(_userObj, i);
-                                                                ulong indexObj = (ulong)_userObjType.GetArrayElementValue(_userObj, i);
-                                                                ClrType indexObjType = GetObjectType(indexObj);
+                                                            ulong indexAddr = _userObjType.GetArrayElementAddress(_userObj, i);
+                                                            ulong indexObj = (ulong)_userObjType.GetArrayElementValue(_userObj, i);
+                                                            ClrType indexObjType = GetObjectType(indexObj);
 
-                                                                if (indexObj != 0 && indexObjType != null)
-                                                                    yield return new HandleRoot(indexAddr, indexObj, indexObjType, HandleType.AsyncPinned, GCRootKind.AsyncPinning, handle.AppDomain);
-                                                            }
-                                                        }
-                                                        else
-                                                        {
-                                                            yield return new HandleRoot(_userObjAddr, _userObj, _userObjType, HandleType.AsyncPinned, GCRootKind.AsyncPinning, handle.AppDomain);
+                                                            if (indexObj != 0 && indexObjType != null)
+                                                                yield return new HandleRoot(indexAddr, indexObj, indexObjType, HandleType.AsyncPinned, GCRootKind.AsyncPinning, handle.AppDomain);
                                                         }
                                                     }
+                                                    else
+                                                    {
+                                                        yield return new HandleRoot(_userObjAddr, _userObj, _userObjType, HandleType.AsyncPinned, GCRootKind.AsyncPinning, handle.AppDomain);
+                                                    }
                                                 }
-                                                else
-                                                {
-                                                    yield return new HandleRoot(_userObjAddr, _userObj, _userObjType, HandleType.AsyncPinned, GCRootKind.AsyncPinning, handle.AppDomain);
-                                                }
+                                            }
+                                            else
+                                            {
+                                                yield return new HandleRoot(_userObjAddr, _userObj, _userObjType, HandleType.AsyncPinned, GCRootKind.AsyncPinning, handle.AppDomain);
                                             }
                                         }
                                     }
+                                }
 
-                                    break;
-                                default:
-                                    Debug.WriteLine("Warning, unknown handle type {0} ignored", Enum.GetName(typeof(HandleType), handle.HandleType));
-                                    break;
-                            }
+                                break;
+                            default:
+                                Debug.WriteLine("Warning, unknown handle type {0} ignored", Enum.GetName(typeof(HandleType), handle.HandleType));
+                                break;
                         }
                     }
                 }
             }
-            else
-            {
-                Trace.WriteLine("Warning, GetHandles() return null!");
-            }
-
+            
             // Finalization Queue
             foreach (ulong objAddr in DesktopRuntime.EnumerateFinalizerQueueObjectAddresses())
                 if (objAddr != 0)
@@ -383,10 +594,8 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 }
 
             // Threads
-            foreach (ClrThread thread in DesktopRuntime.Threads)
-                if (thread.IsAlive)
-                    foreach (var root in thread.EnumerateStackObjects(false))
-                        yield return root;
+            foreach (ClrRoot root in EnumerateStackRoots())
+                yield return root;
         }
 
         internal string GetStringContents(ulong strAddr)
@@ -401,10 +610,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 // .Type being null can happen in minidumps.  In that case we will fall back to
                 // hardcoded values and hope they don't get out of date.
-                if (_firstChar.Type == ErrorType)
+                if (_firstChar?.Type == ErrorType)
                     _firstChar = null;
 
-                if (_stringLength.Type == ErrorType)
+                if (_stringLength?.Type == ErrorType)
                     _stringLength = null;
 
                 _initializedStringFields = true;
@@ -518,15 +727,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         internal IObjectData GetObjectData(ulong address)
         {
-            LastObjectData last = _lastObjData;
-
-            if (_lastObjData != null && _lastObjData.Address == address)
-                return _lastObjData.Data;
-
-            last = new LastObjectData(address, DesktopRuntime.GetObjectData(address));
-            _lastObjData = last;
-
-            return last.Data;
+            return DesktopRuntime.GetObjectData(address);
         }
 
         internal object GetValueAtAddress(ClrElementType cet, ulong addr)
@@ -737,50 +938,35 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return ClrElementType.Struct;
         }
 
-
-        #region private
+        
         protected List<ClrType> _types;
         protected Dictionary<ModuleEntry, int> _typeEntry = new Dictionary<ModuleEntry, int>(new ModuleEntryCompare());
         private Dictionary<ArrayRankHandle, BaseDesktopHeapType> _arrayTypes;
-        private ClrModule _mscorlib;
 
         private ClrInstanceField _firstChar, _stringLength;
         private bool _initializedStringFields = false;
-        private LastObjectData _lastObjData;
         private ClrType[] _basicTypes;
         private bool _loadedTypes = false;
-        #endregion
 
         internal readonly ClrInterface[] EmptyInterfaceList = new ClrInterface[0];
         internal Dictionary<string, ClrInterface> Interfaces = new Dictionary<string, ClrInterface>();
+        private Lazy<ClrType> _arrayType,  _exceptionType;
         private ClrType _free;
+
+        private DictionaryList _objectMap;
+        private ExtendedArray<ObjectInfo> _objects;
+        private ExtendedArray<ulong> _gcRefs;
 
         internal DesktopRuntimeBase DesktopRuntime { get; private set; }
         internal BaseDesktopHeapType ErrorType { get; private set; }
         internal ClrType ObjectType { get; private set; }
         internal ClrType StringType { get; private set; }
         internal ClrType ValueType { get; private set; }
-        public override ClrType Free { get { return _free; } }
-        internal ClrType ExceptionType { get; private set; }
+        internal ClrType ArrayType => _arrayType.Value;
+        public override ClrType Free => _free;
+
+        internal ClrType ExceptionType => _exceptionType.Value;
         internal ClrType EnumType { get; set; }
-        internal ClrType ArrayType { get; private set; }
-
-        private class LastObjectData
-        {
-            public IObjectData Data;
-            public ulong Address;
-            public LastObjectData(ulong addr, IObjectData data)
-            {
-                Address = addr;
-                Data = data;
-            }
-        }
-
-        internal struct LastObjectType
-        {
-            public ulong Address;
-            public ClrType Type;
-        }
 
         private class ModuleEntryCompare : IEqualityComparer<ModuleEntry>
         {
@@ -839,7 +1025,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             _basicTypes[(int)ClrElementType.Object] = ObjectType;
             _basicTypes[(int)ClrElementType.Class] = ObjectType;
 
-            ClrModule mscorlib = Mscorlib;
+            ClrModule mscorlib = DesktopRuntime.Mscorlib;
             if (mscorlib == null)
                 return;
 
@@ -948,7 +1134,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
         internal BaseDesktopHeapType CreatePointerType(BaseDesktopHeapType innerType, ClrElementType clrElementType, string nameHint)
         {
-            return new DesktopPointerType(this, (DesktopBaseModule)Mscorlib, clrElementType, 0, nameHint) { ComponentType = innerType };
+            return new DesktopPointerType(this, (DesktopBaseModule)DesktopRuntime.Mscorlib, clrElementType, 0, nameHint) { ComponentType = innerType };
         }
 
         internal BaseDesktopHeapType GetArrayType(ClrElementType clrElementType, int ranks, string nameHint)
@@ -958,34 +1144,404 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
             var handle = new ArrayRankHandle(clrElementType, ranks);
             if (!_arrayTypes.TryGetValue(handle, out BaseDesktopHeapType result))
-                _arrayTypes[handle] = result = new DesktopArrayType(this, (DesktopBaseModule)Mscorlib, clrElementType, ranks, ArrayType.MetadataToken, nameHint);
+                _arrayTypes[handle] = result = new DesktopArrayType(this, (DesktopBaseModule)DesktopRuntime.Mscorlib, clrElementType, ranks, ArrayType.MetadataToken, nameHint);
 
             return result;
         }
 
-        internal ClrModule Mscorlib
+        internal override long TotalObjects => _objects?.Count ?? -1;
+
+        public override bool IsHeapCached => _objectMap != null;
+
+        public override void ClearHeapCache()
         {
-            get
+            _objectMap = null;
+            _objects = null;
+            _gcRefs = null;
+        }
+
+        public override void CacheHeap(CancellationToken cancelToken)
+        {
+            // TODO
+            Action<long, long> progressReport = null;
+
+            DictionaryList objmap = new DictionaryList();
+            ExtendedArray<ulong> gcrefs = new ExtendedArray<ulong>();
+            ExtendedArray<ObjectInfo> objInfo = new ExtendedArray<ObjectInfo>();
+
+            long totalBytes = Segments.Sum(s => (long)s.Length);
+            long completed = 0;
+
+            uint pointerSize = (uint)PointerSize;
+
+            foreach (ClrSegment seg in Segments)
             {
-                if (_mscorlib == null)
+                progressReport?.Invoke(completed, totalBytes);
+                
+                for (ulong obj = seg.FirstObject; obj < seg.End && obj != 0; obj = seg.NextObject(obj))
                 {
-                    string moduleName = Runtime.ClrInfo.Flavor == ClrFlavor.Core
-                        ? "system.private.corelib"
-                        : "mscorlib";
+                    cancelToken.ThrowIfCancellationRequested();
                     
-                    foreach (ClrModule module in DesktopRuntime.Modules)
+                    // We may
+                    ClrType type = GetObjectType(obj);
+                    if (type == null || GCRoot.IsTooLarge(obj, type, seg))
                     {
-                        if (module.Name.ToLowerInvariant().Contains(moduleName))
+                        AddObject(objmap, gcrefs, objInfo, obj, Free);
+                        do
                         {
-                            _mscorlib = module;
+                            cancelToken.ThrowIfCancellationRequested();
+
+                            obj += pointerSize;
+                            if (obj >= seg.End)
+                                break;
+
+                            type = GetObjectType(obj);
+                        } while (type == null);
+
+                        if (obj >= seg.End)
                             break;
-                        }
+                    }
+                    
+                    AddObject(objmap, gcrefs, objInfo, obj, type);
+                }
+
+                completed += (long)seg.Length;
+            }
+
+            progressReport?.Invoke(totalBytes, totalBytes);
+
+            _objectMap = objmap;
+            _gcRefs = gcrefs;
+            _objects = objInfo;
+        }
+
+        public override IEnumerable<ClrObject> EnumerateObjects()
+        {
+            if (Revision != GetRuntimeRevision())
+                ClrDiagnosticsException.ThrowRevisionError(Revision, GetRuntimeRevision());
+
+            if (IsHeapCached)
+                return _objectMap.Enumerate().Select(item => ClrObject.Create(item.Key, _objects[item.Value].Type));
+            
+            return base.EnumerateObjects();
+        }
+
+        public override IEnumerable<ulong> EnumerateObjectAddresses()
+        {
+            if (Revision != GetRuntimeRevision())
+                ClrDiagnosticsException.ThrowRevisionError(Revision, GetRuntimeRevision());
+
+            if (IsHeapCached)
+                return _objectMap.Enumerate().Select(item => item.Key);
+
+            return base.EnumerateObjectAddresses();
+        }
+
+        public override ClrType GetObjectType(ulong objRef)
+        {
+            Debug.Assert(IsHeapCached);
+
+            if (!_objectMap.TryGetValue(objRef, out int index))
+                return null;
+
+            return _objects[index].Type;
+        }
+
+        internal override void EnumerateObjectReferences(ulong obj, ClrType type, bool carefully, Action<ulong, int> callback)
+        {
+            if (IsHeapCached)
+            {
+                if (type.ContainsPointers && _objectMap.TryGetValue(obj, out int index))
+                {
+                    uint count = _objects[index].RefCount;
+                    uint offset = _objects[index].RefOffset;
+
+
+                    for (uint i = offset; i < offset + count; i++)
+                        callback(_gcRefs[i], 0);
+                }
+            }
+            else
+            {
+                base.EnumerateObjectReferences(obj, type, carefully, callback);
+            }
+
+            if (_dependentHandles == null)
+                BuildDependentHandleMap(CancellationToken.None);
+
+            Debug.Assert(_dependentHandles != null);
+            if (_dependentHandles.TryGetValue(obj, out List<ulong> value))
+                foreach (ulong item in value)
+                    callback(item, -1);
+        }
+
+        internal override IEnumerable<ClrObject> EnumerateObjectReferences(ulong obj, ClrType type, bool carefully)
+        {
+            IEnumerable<ClrObject> result = null;
+            if (IsHeapCached)
+            {
+                if (type.ContainsPointers && _objectMap.TryGetValue(obj, out int index))
+                {
+                    uint count = _objects[index].RefCount;
+                    uint offset = _objects[index].RefOffset;
+
+                    result = EnumerateRefs(offset, count);
+                }
+                else
+                {
+                    result = s_emptyObjectSet;
+                }
+            }
+            else
+            {
+                result = base.EnumerateObjectReferences(obj, type, carefully);
+            }
+
+            if (_dependentHandles == null)
+                BuildDependentHandleMap(CancellationToken.None);
+
+            Debug.Assert(_dependentHandles != null);
+            if (_dependentHandles.TryGetValue(obj, out List<ulong> values))
+                result = result.Union(values.Select(v => ClrObject.Create(v, GetObjectType(v))));
+
+            return result;
+        }
+
+        private IEnumerable<ClrObject> EnumerateRefs(uint offset, uint count)
+        {
+            for (uint i = offset; i < offset + count; i++)
+            {
+                ulong obj = _gcRefs[i];
+                yield return ClrObject.Create(obj, GetObjectType(obj));
+            }
+        }
+
+        private void AddObject(DictionaryList objmap, ExtendedArray<ulong> gcrefs, ExtendedArray<ObjectInfo> objInfo, ulong obj, ClrType type)
+        {
+            uint offset = (uint)gcrefs.Count;
+            
+            if (type.ContainsPointers)
+            {
+                EnumerateObjectReferences(obj, type, true, (addr, offs) =>
+                {
+                    gcrefs.Add(addr);
+                });
+            }
+            
+            uint refCount = (uint)gcrefs.Count - offset;
+            objmap.Add(obj, checked((int)objInfo.Count));
+            objInfo.Add(new ObjectInfo()
+            {
+                Type = type,
+                RefOffset = refCount != 0 ? offset : uint.MaxValue,
+                RefCount = refCount
+            });
+        }
+
+
+
+        protected string GetTypeName(ulong mt, DesktopModule module, uint token)
+        {
+            string typeName = DesktopRuntime.GetNameForMT(mt);
+            return GetBetterTypeName(typeName, module, token);
+        }
+        
+        protected string GetTypeName(TypeHandle hnd, DesktopModule module, uint token)
+        {
+            string typeName = DesktopRuntime.GetTypeName(hnd);
+            return GetBetterTypeName(typeName, module, token);
+        }
+
+        private static string GetBetterTypeName(string typeName, DesktopModule module, uint token)
+        {
+            if (typeName == null || typeName == "<Unloaded Type>")
+            {
+                var builder = GetTypeNameFromToken(module, token);
+                string newName = builder?.ToString();
+                if (newName != null && newName != "<UNKNOWN>")
+                    typeName = newName;
+            }
+            else
+            {
+                typeName = DesktopHeapType.FixGenerics(typeName);
+            }
+
+            return typeName;
+        }
+
+        struct ObjectInfo
+        {
+            public ClrType Type;
+            public uint RefOffset;
+            public uint RefCount;
+
+            public override string ToString()
+            {
+                return $"{Type.Name} refs: {RefCount:n0}";
+            }
+        }
+
+        #region Large array/dictionary helpers
+        internal class ExtendedArray<T>
+        {
+            private const int Initial = 0x100000; // 1 million-ish
+            private const int Secondary = 0x1000000;
+            private const int Complete = 0x4000000;
+
+            private List<T[]> _lists = new List<T[]>();
+            private int _curr = 0;
+
+            public long Count
+            {
+                get
+                {
+                    if (_lists.Count <= 0)
+                        return 0;
+
+                    long total = (_lists.Count - 1) * (long)Complete;
+                    total += _curr;
+                    return total;
+                }
+            }
+
+            public T this[int index]
+            {
+                get
+                {
+                    int arrayIndex = index / Complete;
+                    index %= Complete;
+
+                    return _lists[arrayIndex][index];
+                }
+                set
+                {
+                    int arrayIndex = index / Complete;
+                    index %= Complete;
+
+                    _lists[arrayIndex][index] = value;
+                }
+            }
+
+
+            public T this[long index]
+            {
+                get
+                {
+                    long arrayIndex = index / Complete;
+                    index %= Complete;
+
+                    return _lists[(int)arrayIndex][index];
+                }
+                set
+                {
+                    long arrayIndex = index / Complete;
+                    index %= Complete;
+
+                    _lists[(int)arrayIndex][index] = value;
+                }
+            }
+
+            public void Add(T t)
+            {
+                T[] arr = _lists.LastOrDefault();
+                if (arr == null || _curr == Complete)
+                {
+                    arr = new T[Initial];
+                    _lists.Add(arr);
+                    _curr = 0;
+                }
+
+                if (_curr >= arr.Length)
+                {
+                    if (arr.Length == Complete)
+                    {
+                        arr = new T[Initial];
+                        _lists.Add(arr);
+                        _curr = 0;
+                    }
+                    else
+                    {
+                        int newSize = arr.Length == Initial ? Secondary : Complete;
+
+                        _lists.RemoveAt(_lists.Count - 1);
+                        Array.Resize(ref arr, newSize);
+                        _lists.Add(arr);
                     }
                 }
 
-                return _mscorlib;
+                arr[_curr++] = t;
+            }
+
+            public void Condense()
+            {
+                T[] arr = _lists.LastOrDefault();
+                if (arr != null && _curr < arr.Length)
+                {
+                    _lists.RemoveAt(_lists.Count - 1);
+                    Array.Resize(ref arr, _curr);
+                    _lists.Add(arr);
+                }
             }
         }
+
+        internal class DictionaryList
+        {
+            private const int MaxEntries = 40000000;
+            private List<Entry> _entries = new List<Entry>();
+
+            public IEnumerable<KeyValuePair<ulong,int>> Enumerate()
+            {
+                return _entries.SelectMany(e => e.Dictionary);
+            }
+
+            public void Add(ulong obj, int index)
+            {
+                Entry curr = GetOrCreateEntry(obj);
+                curr.End = obj;
+                curr.Dictionary.Add(obj, index);
+            }
+
+            public bool TryGetValue(ulong obj, out int index)
+            {
+                foreach (Entry entry in _entries)
+                    if (entry.Start <= obj && obj <= entry.End)
+                        return entry.Dictionary.TryGetValue(obj, out index);
+
+                index = 0;
+                return false;
+            }
+
+            private Entry GetOrCreateEntry(ulong obj)
+            {
+                if (_entries.Count == 0)
+                {
+                    return NewEntry(obj);
+                }
+                else
+                {
+                    Entry last = _entries.Last();
+                    if (last.Dictionary.Count > MaxEntries)
+                        return NewEntry(obj);
+
+                    return last;
+                }
+            }
+
+            private Entry NewEntry(ulong obj)
+            {
+                Entry result = new Entry() { Start = obj, End = obj, Dictionary = new SortedDictionary<ulong, int>() };
+                _entries.Add(result);
+                return result;
+            }
+
+            class Entry
+            {
+                public ulong Start;
+                public ulong End;
+                public SortedDictionary<ulong, int> Dictionary;
+            }
+        }
+        #endregion
     }
 
 
@@ -1444,7 +2000,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
     internal class LegacyGCHeap : DesktopGCHeap
     {
-        private LastObjectType _lastObjType = new LastObjectType();
+        private ClrObject _lastObject = new ClrObject();
         private Dictionary<TypeHandle, int> _indices = new Dictionary<TypeHandle, int>(TypeHandle.EqualityComparer);
 
         public LegacyGCHeap(DesktopRuntimeBase runtime)
@@ -1544,36 +2100,13 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 ModuleEntry modEnt = new ModuleEntry(module, tokenEnt);
 
-                // We key the dictionary on a Module/Token pair.  If names do not match, then
-                // do not treat these as the same type (happens with generics).
-                string typeName = DesktopRuntime.GetTypeName(hnd);
-                if (typeName == null || typeName == "<Unloaded Type>")
-                {
-                    var builder = GetTypeNameFromToken(module, token);
-                    typeName = (builder != null) ? builder.ToString() : "<UNKNOWN>";
-                }
-                else
-                {
-                    typeName = DesktopHeapType.FixGenerics(typeName);
-                }
-
-                if (_typeEntry.TryGetValue(modEnt, out index))
-                {
-                    BaseDesktopHeapType match = (BaseDesktopHeapType)_types[index];
-                    if (match.Name == typeName)
-                    {
-                        _indices[hnd] = index;
-                        ret = match;
-                    }
-                }
-
                 if (ret == null)
                 {
                     IMethodTableData mtData = DesktopRuntime.GetMethodTableData(mt);
                     if (mtData == null)
                         return null;
 
-                    ret = new DesktopHeapType(typeName, module, token, mt, mtData, this) { ComponentType = componentType };
+                    ret = new DesktopHeapType(() => GetTypeName(hnd, module, token), module, token, mt, mtData, this) { ComponentType = componentType };
                     index = _types.Count;
                     ((DesktopHeapType)ret).SetIndex(index);
                     _indices[hnd] = index;
@@ -1590,13 +2123,15 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return ret;
         }
 
-
         public override ClrType GetObjectType(ulong objRef)
         {
             ulong mt, cmt = 0;
 
-            if (_lastObjType.Address == objRef)
-                return _lastObjType.Type;
+            if (_lastObject.Address == objRef)
+                return _lastObject.Type;
+
+            if (IsHeapCached)
+                return base.GetObjectType(objRef);
 
             var cache = MemoryReader;
             if (cache.Contains(objRef))
@@ -1633,8 +2168,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             }
 
             ClrType type = GetTypeByMethodTable(mt, cmt, objRef);
-            _lastObjType.Address = objRef;
-            _lastObjType.Type = type;
+            _lastObject = ClrObject.Create(objRef, type);
 
             return type;
         }
@@ -1642,7 +2176,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
     internal class V46GCHeap : DesktopGCHeap
     {
-        private LastObjectType _lastObjType = new LastObjectType();
+        private ClrObject _lastObject;
         private Dictionary<ulong, int> _indices = new Dictionary<ulong, int>();
         
         public V46GCHeap(DesktopRuntimeBase runtime)
@@ -1655,8 +2189,11 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         {
             ulong mt;
 
-            if (_lastObjType.Address == objRef)
-                return _lastObjType.Type;
+            if (_lastObject.Address == objRef)
+                return _lastObject.Type;
+
+            if (IsHeapCached)
+                return base.GetObjectType(objRef);
 
             var cache = MemoryReader;
             if (cache.Contains(objRef))
@@ -1680,8 +2217,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 mt &= ~3UL;
             
             ClrType type = GetTypeByMethodTable(mt, 0, objRef);
-            _lastObjType.Address = objRef;
-            _lastObjType.Type = type;
+            _lastObject = ClrObject.Create(objRef, type);
 
             return type;
         }
@@ -1721,36 +2257,13 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
                 ModuleEntry modEnt = new ModuleEntry(module, tokenEnt);
 
-                // We key the dictionary on a Module/Token pair.  If names do not match, then
-                // do not treat these as the same type (happens with generics).
-                string typeName = DesktopRuntime.GetNameForMT(mt);
-                if (typeName == null || typeName == "<Unloaded Type>")
-                {
-                    var builder = GetTypeNameFromToken(module, token);
-                    typeName = (builder != null) ? builder.ToString() : "<UNKNOWN>";
-                }
-                else
-                {
-                    typeName = DesktopHeapType.FixGenerics(typeName);
-                }
-
-                if (_typeEntry.TryGetValue(modEnt, out index))
-                {
-                    BaseDesktopHeapType match = (BaseDesktopHeapType)_types[index];
-                    if (match.Name == typeName)
-                    {
-                        _indices[mt] = index;
-                        ret = match;
-                    }
-                }
-
                 if (ret == null)
                 {
                     IMethodTableData mtData = DesktopRuntime.GetMethodTableData(mt);
                     if (mtData == null)
                         return null;
 
-                    ret = new DesktopHeapType(typeName, module, token, mt, mtData, this);
+                    ret = new DesktopHeapType(() => GetTypeName(mt, module, token), module, token, mt, mtData, this);
 
                     index = _types.Count;
                     ((DesktopHeapType)ret).SetIndex(index);

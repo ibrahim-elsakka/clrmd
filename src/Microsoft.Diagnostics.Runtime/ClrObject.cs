@@ -7,10 +7,12 @@ using System.Threading.Tasks;
 
 namespace Microsoft.Diagnostics.Runtime
 {
+    
     /// <summary>
     /// Represents an object in the target process.
     /// </summary>
-    public struct ClrObject
+    [DebuggerDisplay("Address={HexAddress}, Type={Type.Name}")]
+    public struct ClrObject : IEquatable<ClrObject>
     {
         private ulong _address;
         private ClrType _type;
@@ -36,14 +38,28 @@ namespace Microsoft.Diagnostics.Runtime
             _address = address;
             _type = type;
 
-            Debug.Assert(type != null);
+            Debug.Assert(address == 0 || type != null);
             Debug.Assert(address == 0 || type.Heap.GetObjectType(address) == type);
+        }
+        
+        /// <summary>
+        /// Enumerates all objects that this object references.
+        /// </summary>
+        /// <returns>An enumeration of object references.</returns>
+        public IEnumerable<ClrObject> EnumerateObjectReferences(bool carefully=false)
+        {
+            return _type.Heap.EnumerateObjectReferences(_address, _type, carefully);
         }
 
         /// <summary>
         /// The address of the object.
         /// </summary>
         public ulong Address { get { return _address; } }
+
+        /// <summary>
+        /// The address of the object in Hex format.
+        /// </summary>
+        public string HexAddress { get { return _address.ToString("x"); } }
 
         /// <summary>
         /// The type of the object.
@@ -84,7 +100,32 @@ namespace Microsoft.Diagnostics.Runtime
             }
         }
 
+        /// <summary>
+        /// Returns true if this object possibly contians GC pointers.
+        /// </summary>
+        public bool ContainsPointers { get => _type != null && _type.ContainsPointers; }
 
+        /// <summary>
+        /// ToString override.
+        /// </summary>
+        /// <returns></returns>
+        public override string ToString()
+        {
+            return $"{_type?.Name} {_address:x}";
+        }
+
+        /// <summary>
+        /// Converts a ClrObject into its string value.
+        /// </summary>
+        /// <param name="obj">A string object.</param>
+        public static explicit operator string(ClrObject obj)
+        {
+            if (!obj.Type.IsString)
+                throw new InvalidOperationException("Object {obj} is not a string.");
+
+            return (string)obj.Type.GetValue(obj.Address);
+        }
+        
         #region GetField
         /// <summary>
         /// Gets the given object reference field from this ClrObject.  Throws ArgumentException if the given field does
@@ -112,6 +153,31 @@ namespace Microsoft.Diagnostics.Runtime
 
             ClrType type = heap.GetObjectType(obj);
             return new ClrObject(obj, type);
+        }
+
+        /// <summary>
+        /// </summary>
+        /// <param name="fieldName"></param>
+        /// <returns></returns>
+        public ClrValueClass GetValueClassField(string fieldName)
+        {
+            if (IsNull)
+                throw new NullReferenceException();
+
+            ClrInstanceField field = _type.GetFieldByName(fieldName);
+            if (field == null)
+                throw new ArgumentException($"Type '{_type.Name}' does not contain a field named '{fieldName}'");
+
+            if (!field.IsValueClass)
+                throw new ArgumentException($"Field '{_type.Name}.{fieldName}' is not a ValueClass.");
+
+            if (field.Type == null)
+                throw new Exception("Field does not have an associated class.");
+
+            ClrHeap heap = _type.Heap;
+
+            ulong addr = field.GetAddress(_address);
+            return new ClrValueClass(addr, field.Type, true);
         }
 
         /// <summary>
@@ -149,12 +215,14 @@ namespace Microsoft.Diagnostics.Runtime
             if (!runtime.ReadPointer(address, out ulong str))
                 throw new MemoryReadException(address);
 
+            if (str == 0)
+                return null;
+
             if (!runtime.ReadString(str, out string result))
                 throw new MemoryReadException(str);
 
             return result;
         }
-
 
         private ulong GetFieldAddress(string fieldName, ClrElementType element, string typeName)
         {
@@ -171,6 +239,70 @@ namespace Microsoft.Diagnostics.Runtime
             ulong address = field.GetAddress(Address);
             return address;
         }
+        #endregion
+
+        #region IEquatable<ClrObject> 
+
+        /// <summary>
+        /// Determines if this instance and another specific <see cref="ClrObject"/> have the same value.
+        /// <para>Instances are considered equal when they have same <see cref="Address"/>.</para>
+        /// </summary>
+        /// <param name="other">The <see cref="ClrObject"/> to compare to this instance.</param>
+        /// <returns><c>true</c> if the <see cref="Address"/> of the parameter is same as <see cref="Address"/> in this instance; <c>false</c> otherwise.</returns>
+        public bool Equals(ClrObject other)
+        {
+             return this.Address == other.Address;
+        }
+        #endregion
+
+        #region Object overrides
+
+        /// <summary>
+        /// Determines whether this instance and a specified object, which must also be a <see cref="ClrObject"/>, have the same value.
+        /// </summary>
+        /// <param name="other">The <see cref="ClrObject"/> to compare to this instance.</param>
+        /// <returns><c>true</c> if <paramref name="other"/> is <see cref="ClrObject"/>, and its <see cref="Address"/> is same as <see cref="Address"/> in this instance; <c>false</c> otherwise.</returns>
+        public override bool Equals(object other)
+        {
+            if (other == null)
+                return false;
+            return (other is ClrObject) && this.Equals((ClrObject)other);
+        }
+
+        /// <summary>
+        /// Returns the hash code for this <see cref="ClrObject"/> based on its <see cref="Address"/>.
+        /// </summary>
+        /// <returns>An <see cref="int"/> hash code for this instance.</returns>
+        public override int GetHashCode()
+        {
+            return this.Address.GetHashCode();
+        }
+        #endregion
+
+        #region Operators overloads
+
+        /// <summary>
+        /// Determines whether two specified <see cref="ClrObject"/> have the same value.
+        /// </summary>
+        /// <param name="left">First <see cref="ClrObject"/> to compare.</param>
+        /// <param name="right">Second <see cref="ClrObject"/> to compare.</param>
+        /// <returns><c>true</c> if <paramref name="left"/> <see cref="Equals(ClrObject)"/> <paramref name="right"/>; <c>false</c> otherwise.</returns>
+        public static bool operator ==(ClrObject left, ClrObject right)
+        {
+            return left.Equals(right);
+        }
+
+        /// <summary>
+        /// Determines whether two specified <see cref="ClrObject"/> have different values.
+        /// </summary>
+        /// <param name="left">First <see cref="ClrObject"/> to compare.</param>
+        /// <param name="right">Second <see cref="ClrObject"/> to compare.</param>
+        /// <returns><c>true</c> if the value of <paramref name="left"/> is different from the value of <paramref name="right"/>; <c>false</c> otherwise.</returns>
+        public static bool operator !=(ClrObject left, ClrObject right)
+        {
+            return !left.Equals(right);
+        }
+
         #endregion
     }
 }
