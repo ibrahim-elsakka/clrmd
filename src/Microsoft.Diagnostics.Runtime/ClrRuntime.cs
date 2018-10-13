@@ -178,6 +178,20 @@ namespace Microsoft.Diagnostics.Runtime
         abstract public void Flush();
 
         /// <summary>
+        /// TODO:
+        /// </summary>
+        /// <param name="address"></param>
+        /// <returns></returns>
+        public abstract string GetJitHelperFunctionName(ulong address);
+
+        /// <summary>
+        /// TODO:
+        /// </summary>
+        /// <param name="address"></param>
+        /// <returns></returns>
+        public abstract string GetMethodTableName(ulong address);
+
+        /// <summary>
         /// Delegate called when the RuntimeFlushed event is triggered.
         /// </summary>
         /// <param name="runtime">Which runtime was flushed.</param>

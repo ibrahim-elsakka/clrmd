@@ -858,6 +858,24 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         {
             return PointerSize == 8 ? 0x74u : 0x38u;
         }
+
+        public override string GetJitHelperFunctionName(ulong address)
+        {
+            ClearBuffer();
+            if (!Request(DacRequests.JIT_HELPER_FUNCTION_NAME, address, _buffer))
+                return null;
+
+            int len = Array.IndexOf(_buffer, (byte)0);
+            Debug.Assert(len >= 0);
+            if (len < 0)
+                return null;
+            return Encoding.ASCII.GetString(_buffer, 0, len);
+        }
+
+        public override string GetMethodTableName(ulong address)
+        {
+            return GetNameForMT(address);
+        }
     }
 
 

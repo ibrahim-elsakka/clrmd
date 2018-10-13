@@ -886,6 +886,26 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         {
             return PointerSize == 8 ? 0x8cu : 0x40u;
         }
+
+        public override string GetJitHelperFunctionName(ulong address)
+        {
+            if (_sos.GetJitHelperFunctionName(address, 0, null, out uint count) < 0)
+                return null;
+
+            if (count == 0)
+                return "";
+
+            byte[] data = new byte[(int)count];
+            if (_sos.GetJitHelperFunctionName(address, count, data, out count) < 0)
+                return null;
+
+            return Encoding.ASCII.GetString(data, 0, data.Length - 1);
+        }
+
+        public override string GetMethodTableName(ulong address)
+        {
+            return GetNameForMT(address);
+        }
     }
     [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("3E269830-4A2B-4301-8EE2-D6805B29B2FA")]
 
@@ -982,7 +1002,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         [PreserveSig]
         int GetJitManagerList(uint count, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 0)] LegacyJitManagerInfo[] jitManagers, out uint pNeeded);
         [PreserveSig]
-        int GetJitHelperFunctionName(ulong ip, uint count, char name, out uint pNeeded);
+        int GetJitHelperFunctionName(ulong ip, uint count, [Out, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 1)] byte[] name, out uint pNeeded);
         [PreserveSig]
         int GetJumpThunkTarget_do_not_use(uint ctx, out ulong targetIP, out ulong targetMD);
 

@@ -481,5 +481,15 @@ namespace Microsoft.Diagnostics.Runtime.Native
         {
             throw new NotImplementedException();
         }
+
+        public override string GetJitHelperFunctionName(ulong address)
+        {
+            return null;//TODO:
+        }
+
+        public override string GetMethodTableName(ulong address)
+        {
+            return null;//TODO:
+        }
     }
 }
