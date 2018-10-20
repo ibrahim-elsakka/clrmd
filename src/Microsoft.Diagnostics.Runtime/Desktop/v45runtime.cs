@@ -637,20 +637,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return PointerSize == 8 ? 0x8cu : 0x40u;
         }
 
-        public override string GetJitHelperFunctionName(ulong address)
-        {
-            if (_sos.GetJitHelperFunctionName(address, 0, null, out uint count) < 0)
-                return null;
-
-            if (count == 0)
-                return "";
-
-            byte[] data = new byte[(int)count];
-            if (_sos.GetJitHelperFunctionName(address, count, data, out count) < 0)
-                return null;
-
-            return Encoding.ASCII.GetString(data, 0, data.Length - 1);
-        }
+        public override string GetJitHelperFunctionName(ulong address) => _sos.GetJitHelperFunctionName(address);
 
         public override string GetMethodTableName(ulong address)
         {
