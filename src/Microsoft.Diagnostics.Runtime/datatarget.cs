@@ -1894,10 +1894,10 @@ namespace Microsoft.Diagnostics.Runtime
             if (hr != 0)
                 return;
 
-            version.Minor = (ushort)Marshal.ReadInt16(buffer, 8);
-            version.Major = (ushort)Marshal.ReadInt16(buffer, 10);
-            version.Patch = (ushort)Marshal.ReadInt16(buffer, 12);
-            version.Revision = (ushort)Marshal.ReadInt16(buffer, 14);
+            version.Minor = (ushort)BitConverter.ToInt16(buffer, 8);
+            version.Major = (ushort)BitConverter.ToInt16(buffer, 10);
+            version.Patch = (ushort)BitConverter.ToInt16(buffer, 12);
+            version.Revision = (ushort)BitConverter.ToInt16(buffer, 14);
 
             return;
         }
