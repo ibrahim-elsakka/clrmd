@@ -315,6 +315,10 @@ namespace Microsoft.Diagnostics.Runtime.Native
         {
             get { return elementTypeHandle; }
         }
+
+        public uint Token => 0;
+
+        public ulong Module => 0;
     }
 
     internal struct NativeSegementData : ISegmentData
@@ -411,24 +415,24 @@ namespace Microsoft.Diagnostics.Runtime.Native
             get { return generation_table0.AllocContextLimit; }
         }
 
-        public ulong FQAllObjectsStop
-        {
-            get { return finalization_fill_pointers5; }
-        }
-
         public ulong FQAllObjectsStart
-        {
-            get { return finalization_fill_pointers4; }
-        }
-
-        public ulong FQRootsStart
         {
             get { return finalization_fill_pointers0; }
         }
 
-        public ulong FQRootsEnd
+        public ulong FQAllObjectsStop
         {
             get { return finalization_fill_pointers3; }
+        }
+
+        public ulong FQRootsStart
+        {
+            get { return finalization_fill_pointers4; }
+        }
+
+        public ulong FQRootsStop
+        {
+            get { return finalization_fill_pointers5; }
         }
 
         public ulong Gen0Start

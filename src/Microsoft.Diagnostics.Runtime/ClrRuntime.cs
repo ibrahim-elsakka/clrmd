@@ -1,6 +1,7 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+using Microsoft.Diagnostics.Runtime.ComWrappers;
 using Microsoft.Diagnostics.Runtime.Desktop;
 using System;
 using System.Collections.Generic;
@@ -825,7 +826,7 @@ namespace Microsoft.Diagnostics.Runtime
     {
         private static ulong[] s_emptyPointerArray = new ulong[0];
         protected DacLibrary _library;
-        protected IXCLRDataProcess _dacInterface;
+        protected ClrDataProcess _dacInterface;
         private MemoryReader _cache;
         protected IDataReader _dataReader;
         protected DataTargetImpl _dataTarget;
@@ -870,15 +871,10 @@ namespace Microsoft.Diagnostics.Runtime
             get { return _dataTarget; }
         }
 
-        public void RegisterForRelease(object o)
-        {
-            if (o != null)
-                _library.AddToReleaseList(o);
-        }
-
         public void RegisterForRelease(IModuleData module)
         {
-            RegisterForRelease(module?.LegacyMetaDataImport);
+            if (module != null)
+                COMHelper.Release(module.LegacyMetaDataImport);
         }
 
         public IDataReader DataReader
@@ -989,7 +985,7 @@ namespace Microsoft.Diagnostics.Runtime
             {
                 foreach (SubHeap heap in heaps)
                 {
-                    foreach (ulong objAddr in GetPointersInRange(heap.FQStart, heap.FQStop))
+                    foreach (ulong objAddr in GetPointersInRange(heap.FQRootsStart, heap.FQRootsStop))
                     {
                         if (objAddr != 0)
                             yield return objAddr;

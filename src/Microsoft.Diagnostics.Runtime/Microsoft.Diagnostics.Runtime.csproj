@@ -1,13 +1,15 @@
+<<<<<<< HEAD
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <Import Project="..\..\..\..\..\DnSpyCommon.props" />
 
   <PropertyGroup>
     <SignAssembly>True</SignAssembly>
-    <AssemblyOriginatorKeyFile>..\..\clrmd.snk</AssemblyOriginatorKeyFile>
+    <AssemblyOriginatorKeyFile>..\Microsoft.Diagnostics.Runtime.snk</AssemblyOriginatorKeyFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <DefineConstants Condition=" '$(IsDotNetFramework)' == 'true' ">$(DefineConstants);NET45</DefineConstants>
   </PropertyGroup>
 
 </Project>

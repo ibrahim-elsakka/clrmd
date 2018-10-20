@@ -1,10 +1,12 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
+using Microsoft.Diagnostics.Runtime.ComWrappers;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 
@@ -176,37 +178,29 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return result;
         }
 
-        protected static StringBuilder GetTypeNameFromToken(DesktopModule module, uint token)
+        protected static string GetTypeNameFromToken(DesktopModule module, uint token)
         {
             if (module == null)
                 return null;
 
-            ICorDebug.IMetadataImport meta = module.GetMetadataImport();
+            MetaDataImport meta = module.GetMetadataImport();
             if (meta == null)
                 return null;
 
             // Get type name.
-            StringBuilder typeBuilder = new StringBuilder(256);
-            int res = meta.GetTypeDefProps((int)token, typeBuilder, typeBuilder.Capacity, out int typeDefLen, out System.Reflection.TypeAttributes typeAttrs, out int ptkExtends);
-            if (res < 0)
+            if (!meta.GetTypeDefProperties((int)token, out string name, out TypeAttributes attrs, out int parent))
                 return null;
-
-            res = meta.GetNestedClassProps((int)token, out int enclosing);
-            if (res == 0 && token != enclosing)
+            
+            if (meta.GetNestedClassProperties((int)token, out int enclosing) && token != enclosing)
             {
-                StringBuilder inner = GetTypeNameFromToken(module, (uint)enclosing);
+                string inner = GetTypeNameFromToken(module, (uint)enclosing);
                 if (inner == null)
-                {
-                    inner = new StringBuilder(typeBuilder.Capacity + 16);
-                    inner.Append("<UNKNOWN>");
-                }
+                    inner = "<UNKNOWN>";
 
-                inner.Append('+');
-                inner.Append(typeBuilder);
-                return inner;
+                return $"{inner}+{name}";
             }
 
-            return typeBuilder;
+            return name;
         }
 
 
@@ -217,7 +211,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             {
                 foreach (SubHeap heap in heaps)
                 {
-                    foreach (ulong obj in DesktopRuntime.GetPointersInRange(heap.FQLiveStart, heap.FQLiveStop))
+                    foreach (ulong obj in DesktopRuntime.GetPointersInRange(heap.FQAllObjectsStart, heap.FQAllObjectsStop))
                     {
                         if (obj == 0)
                             continue;
@@ -684,7 +678,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             if (ads == null)
                 return;
 
-            IList<ulong> appDomains = DesktopRuntime.GetAppDomainList(ads.Count);
+            ulong[] appDomains = DesktopRuntime.GetAppDomainList(ads.Count);
             if (appDomains == null)
                 return;
 
@@ -1009,8 +1003,31 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             if (_basicTypes == null)
                 InitBasicTypes();
 
-
-            return _basicTypes[(int)elType];
+            if (_basicTypes[(int)elType] == null && this.DesktopRuntime.DataReader.IsMinidump)
+            {
+                switch (elType)
+                {
+                    case ClrElementType.Boolean:
+                    case ClrElementType.Char:
+                    case ClrElementType.Double:
+                    case ClrElementType.Float:
+                    case ClrElementType.Pointer:
+                    case ClrElementType.NativeInt:
+                    case ClrElementType.FunctionPointer:
+                    case ClrElementType.NativeUInt:
+                    case ClrElementType.Int16:
+                    case ClrElementType.Int32:
+                    case ClrElementType.Int64:
+                    case ClrElementType.Int8:
+                    case ClrElementType.UInt16:
+                    case ClrElementType.UInt32:
+                    case ClrElementType.UInt64:
+                    case ClrElementType.UInt8:
+                        _basicTypes[(int)elType] = new PrimitiveType(this, elType);
+                        break;
+                }
+            }
+            return _basicTypes[(int)elType]; ;
         }
 
         private void InitBasicTypes()
@@ -1129,7 +1146,8 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 }
             }
 
-            Debug.Assert(DesktopRuntime.DataReader.IsMinidump || count == 14);
+            Debug.Assert(DesktopRuntime.DataReader.IsMinidump || count == 14);           
+
         }
 
         internal BaseDesktopHeapType CreatePointerType(BaseDesktopHeapType innerType, ClrElementType clrElementType, string nameHint)
@@ -2213,8 +2231,11 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 mt = DesktopRuntime.DataReader.ReadPointerUnsafe(objRef);
             }
 
-            if ((((int)mt) & 3) != 0)
-                mt &= ~3UL;
+            unchecked
+            {
+                if ((((byte)mt) & 3) != 0)
+                    mt &= ~3UL;
+            }
             
             ClrType type = GetTypeByMethodTable(mt, 0, objRef);
             _lastObject = ClrObject.Create(objRef, type);
@@ -2253,7 +2274,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 // Dynamic functions/modules
                 uint tokenEnt = token;
                 if (!isFree && (module == null || module.IsDynamic))
-                    tokenEnt = (uint)mt;
+                    tokenEnt = unchecked((uint)mt);
 
                 ModuleEntry modEnt = new ModuleEntry(module, tokenEnt);
 

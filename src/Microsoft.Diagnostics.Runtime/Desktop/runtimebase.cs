@@ -9,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Linq;
 using Microsoft.Diagnostics.Runtime.ICorDebug;
 using System.Threading;
+using Microsoft.Diagnostics.Runtime.ComWrappers;
 
 #pragma warning disable 649
 
@@ -71,6 +72,8 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             
             MemoryReader = null;
             _moduleList = null;
+            _modules = new Dictionary<ulong, DesktopModule>();
+            _moduleFiles = new Dictionary<string, DesktopModule>();
             _threads = new Lazy<List<ClrThread>>(CreateThreadList);
             _appDomains = new Lazy<DomainContainer>(CreateAppDomainList);
             _heap = new Lazy<DesktopGCHeap>(CreateHeap);
@@ -215,7 +218,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             {
                 threads.Add(new DesktopThread(this, thread, addr, addr == finalizer));
                 addr = thread.Next;
-                if (seen.Contains(addr))
+                if (seen.Contains(addr) || addr == 0)
                     break;
 
                 seen.Add(addr);
@@ -419,7 +422,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             IAppDomainStoreData ads = GetAppDomainStoreData();
             if (ads != null)
             {
-                IList<ulong> appDomains = GetAppDomainList(ads.Count);
+                ulong[] appDomains = GetAppDomainList(ads.Count);
                 if (appDomains != null)
                 {
                     foreach (ulong addr in appDomains)
@@ -504,7 +507,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         #region Internal Functions
         protected ClrThread GetThreadByStackAddress(ulong address)
         {
-            Debug.Assert(address != 0);
+            Debug.Assert(address != 0 || _dataReader.IsMinidump);
 
             foreach (ClrThread thread in _threads.Value)
             {
@@ -660,7 +663,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             if (ads == null)
                 return new DomainContainer();
 
-            IList<ulong> domains = GetAppDomainList(ads.Count);
+            ulong[] domains = GetAppDomainList(ads.Count);
             if (domains == null)
                 return new DomainContainer();
 
@@ -762,39 +765,21 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             return GetNameForMT(id.MethodTable);
         }
 
-        protected IXCLRDataProcess GetClrDataProcess()
-        {
-            return _dacInterface;
-        }
-
 
         internal IEnumerable<ClrStackFrame> EnumerateStackFrames(DesktopThread thread)
         {
-            IXCLRDataProcess proc = GetClrDataProcess();
-
-            int res = proc.GetTaskByOSThreadID(thread.OSThreadId, out object tmp);
-            if (res < 0)
-                yield break;
-
-            IXCLRDataTask task = null;
-            IXCLRDataStackWalk stackwalk = null;
-
-            try
+            using (ClrStackWalk stackwalk = _dacInterface.CreateStackWalk(thread.OSThreadId, 0xf))
             {
-                task = (IXCLRDataTask)tmp;
-                res = task.CreateStackWalk(0xf, out tmp);
-                if (res < 0)
+                if (stackwalk == null)
                     yield break;
 
-                stackwalk = (IXCLRDataStackWalk)tmp;
                 byte[] ulongBuffer = new byte[8];
                 byte[] context = ContextHelper.Context;
                 do
                 {
-                    res = stackwalk.GetContext(ContextHelper.ContextFlags, ContextHelper.Length, out uint size, context);
-                    if (res < 0 || res == 1)
+                    if (!stackwalk.GetContext(ContextHelper.ContextFlags, ContextHelper.Length, out uint size, context))
                         break;
-
+                    
                     ulong ip, sp;
 
                     if (PointerSize == 4)
@@ -807,90 +792,50 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                         ip = BitConverter.ToUInt64(context, ContextHelper.InstructionPointerOffset);
                         sp = BitConverter.ToUInt64(context, ContextHelper.StackPointerOffset);
                     }
-
-                    res = stackwalk.Request(0xf0000000, 0, null, (uint)ulongBuffer.Length, ulongBuffer);
-
-                    ulong frameVtbl = 0;
-                    if (res >= 0)
+                    
+                    ulong frameVtbl = stackwalk.GetFrameVtable();
+                    if (frameVtbl != 0)
                     {
-                        frameVtbl = BitConverter.ToUInt64(ulongBuffer, 0);
-                        if (frameVtbl != 0)
-                        {
-                            sp = frameVtbl;
-                            ReadPointer(sp, out frameVtbl);
-                        }
+                        sp = frameVtbl;
+                        ReadPointer(sp, out frameVtbl);
                     }
 
-                    DesktopStackFrame frame = GetStackFrame(thread, res, ip, sp, frameVtbl);
+                    DesktopStackFrame frame = GetStackFrame(thread, ip, sp, frameVtbl);
                     yield return frame;
-                } while (stackwalk.Next() == 0);
-            }
-            finally
-            {
-                if (task != null)
-                    Marshal.FinalReleaseComObject(task);
-
-                if (stackwalk != null)
-                    Marshal.FinalReleaseComObject(stackwalk);
+                } while (stackwalk.Next());
             }
         }
 
         internal ILToNativeMap[] GetILMap(ulong ip)
         {
-            List<ILToNativeMap> list = null;
-            ILToNativeMap[] tmp = null;
+            List<ILToNativeMap> list = new List<ILToNativeMap>();
 
-            int res = _dacInterface.StartEnumMethodInstancesByAddress(ip, null, out ulong handle);
-            if (res < 0)
-                return null;
-
-            res = _dacInterface.EnumMethodInstanceByAddress(ref handle, out object objMethod);
-
-            while (res == 0)
+            foreach (ClrDataMethod method in _dacInterface.EnumerateMethodInstancesByAddress(ip))
             {
-                IXCLRDataMethodInstance method = (IXCLRDataMethodInstance)objMethod;
-                res = method.GetILAddressMap(0, out uint needed, null);
-                if (res == 0)
+                ILToNativeMap[] map = method.GetILToNativeMap();
+                if (map != null)
                 {
-                    tmp = new ILToNativeMap[needed];
-                    res = method.GetILAddressMap(needed, out needed, tmp);
-
-                    for (int i = 0; i < tmp.Length; i++)
+                    for (int i = 0; i < map.Length; i++)
                     {
                         // There seems to be a bug in IL to native mappings where a throw statement
                         // may end up with an end address lower than the start address.  This is a
                         // workaround for that issue.
-                        if (tmp[i].StartAddress > tmp[i].EndAddress)
+                        if (map[i].StartAddress > map[i].EndAddress)
                         {
-                            if (i + 1 == tmp.Length)
-                                tmp[i].EndAddress = tmp[i].StartAddress + 0x20;
+                            if (i + 1 == map.Length)
+                                map[i].EndAddress = map[i].StartAddress + 0x20;
                             else
-                                tmp[i].EndAddress = tmp[i + 1].StartAddress - 1;
+                                map[i].EndAddress = map[i + 1].StartAddress - 1;
                         }
                     }
 
-                    if (res != 0)
-                        tmp = null;
+                    list.AddRange(map);
                 }
 
-                res = _dacInterface.EnumMethodInstanceByAddress(ref handle, out objMethod);
-                if (res == 0 && tmp != null)
-                {
-                    if (list == null)
-                        list = new List<ILToNativeMap>();
-
-                    list.AddRange(tmp);
-                }
+                method.Dispose();
             }
 
-            if (list != null)
-            {
-                list.AddRange(tmp);
-                return list.ToArray();
-            }
-
-            _dacInterface.EndEnumMethodInstancesByAddress(handle);
-            return tmp;
+            return list.ToArray();
         }
 
         #endregion
@@ -901,7 +846,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         internal abstract uint GetExceptionHROffset();
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         internal delegate void LoaderHeapTraverse(ulong address, IntPtr size, int isCurrent);
-        internal abstract IList<ulong> GetAppDomainList(int count);
+        internal abstract ulong[] GetAppDomainList(int count);
         internal abstract ulong[] GetAssemblyList(ulong appDomain, int count);
         internal abstract ulong[] GetModuleList(ulong assembly, int count);
         internal abstract IAssemblyData GetAssemblyData(ulong domain, ulong assembly);
@@ -918,7 +863,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         internal abstract ulong GetModuleForMT(ulong mt);
         internal abstract IFieldInfo GetFieldInfo(ulong mt);
         internal abstract IFieldData GetFieldData(ulong fieldDesc);
-        internal abstract ICorDebug.IMetadataImport GetMetadataImport(ulong module);
+        internal abstract MetaDataImport GetMetadataImport(ulong module);
         internal abstract IObjectData GetObjectData(ulong objRef);
         internal abstract ulong GetMethodTableByEEClass(ulong eeclass);
         internal abstract IList<MethodTableTokenPair> GetMethodTableList(ulong module);
@@ -933,7 +878,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         internal abstract string GetNameForMD(ulong md);
         internal abstract IMethodDescData GetMethodDescData(ulong md);
         internal abstract uint GetMetadataToken(ulong mt);
-        protected abstract DesktopStackFrame GetStackFrame(DesktopThread thread, int res, ulong ip, ulong sp, ulong frameVtbl);
+        protected abstract DesktopStackFrame GetStackFrame(DesktopThread thread, ulong ip, ulong sp, ulong frameVtbl);
         internal abstract IList<ClrStackFrame> GetExceptionStackTrace(ulong obj, ClrType type);
         internal abstract string GetAssemblyName(ulong assembly);
         internal abstract string GetAppBase(ulong appDomain);
@@ -1240,10 +1185,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         internal ulong Gen2Start { get { return ActualHeap.Gen2Start; } }
         internal ulong FirstLargeSegment { get { return ActualHeap.FirstLargeHeapSegment; } }
         internal ulong FirstSegment { get { return ActualHeap.FirstHeapSegment; } }
-        internal ulong FQStart { get { return ActualHeap.FQAllObjectsStart; } }
-        internal ulong FQStop { get { return ActualHeap.FQAllObjectsStop; } }
-        internal ulong FQLiveStart { get { return ActualHeap.FQRootsStart; } }
-        internal ulong FQLiveStop { get { return ActualHeap.FQRootsEnd; } }
+        internal ulong FQAllObjectsStart { get { return ActualHeap.FQAllObjectsStart; } }
+        internal ulong FQAllObjectsStop { get { return ActualHeap.FQAllObjectsStop; } }
+        internal ulong FQRootsStart { get { return ActualHeap.FQRootsStart; } }
+        internal ulong FQRootsStop { get { return ActualHeap.FQRootsStop; } }
 
         internal SubHeap(IHeapDetails heap, int heapNum, Dictionary<ulong,ulong> allocPointers)
         {
@@ -1357,7 +1302,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         ulong FQAllObjectsStart { get; }
         ulong FQAllObjectsStop { get; }
         ulong FQRootsStart { get; }
-        ulong FQRootsEnd { get; }
+        ulong FQRootsStop { get; }
     }
 
     internal interface IGCInfo
@@ -1370,6 +1315,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
 
     internal interface IMethodTableData
     {
+        uint Token { get; }
         bool Shared { get; }
         bool Free { get; }
         bool ContainsPointers { get; }
@@ -1379,6 +1325,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         ulong Parent { get; }
         uint NumMethods { get; }
         ulong ElementTypeHandle { get; }
+        ulong Module { get; }
     }
 
     internal interface IFieldInfo
@@ -1430,7 +1377,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         ulong PEFile { get; }
         ulong LookupTableHeap { get; }
         ulong ThunkHeap { get; }
-        object LegacyMetaDataImport { get; }
+        IntPtr LegacyMetaDataImport { get; }
         ulong ModuleId { get; }
         ulong ModuleIndex { get; }
         ulong Assembly { get; }
