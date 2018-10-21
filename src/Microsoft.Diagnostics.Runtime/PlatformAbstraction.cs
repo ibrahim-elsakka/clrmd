@@ -81,10 +81,10 @@ namespace Microsoft.Diagnostics.Runtime
             byte[] vsFixedInfo = new byte[len];
             Marshal.Copy(ptr, vsFixedInfo, 0, len);
 
-            minor = (ushort)Marshal.ReadInt16(vsFixedInfo, 8);
-            major = (ushort)Marshal.ReadInt16(vsFixedInfo, 10);
-            patch = (ushort)Marshal.ReadInt16(vsFixedInfo, 12);
-            revision = (ushort)Marshal.ReadInt16(vsFixedInfo, 14);
+            minor = (ushort)BitConverter.ToInt16(vsFixedInfo, 8);
+            major = (ushort)BitConverter.ToInt16(vsFixedInfo, 10);
+            patch = (ushort)BitConverter.ToInt16(vsFixedInfo, 12);
+            revision = (ushort)BitConverter.ToInt16(vsFixedInfo, 14);
 
             return true;
         }
