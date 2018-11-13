@@ -7,23 +7,35 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
 {
     public unsafe class CallableCOMWrapper : COMHelper, IDisposable
     {
-        private static int _totalInstances;
-
-        public static int TotalInstances => _totalInstances;
-
         private bool _disposed = false;
 
         protected IntPtr Self { get; }
         private IUnknownVTable* _unknownVTable;
-        private readonly GCHandle _library;
+        private readonly RefCountedFreeLibrary _library;
 
         protected void* _vtable => _unknownVTable + 1;
 
         private ReleaseDelegate _release;
 
-        internal CallableCOMWrapper(DacLibrary library, ref Guid desiredInterface, IntPtr pUnknown)
+        internal CallableCOMWrapper(CallableCOMWrapper toClone)
         {
-            Interlocked.Increment(ref _totalInstances);
+            if (toClone._disposed)
+                throw new ObjectDisposedException(GetType().FullName);
+
+            Self = toClone.Self;
+            _unknownVTable = toClone._unknownVTable;
+            _library = toClone._library;
+            
+            AddRefDelegate addRef = (AddRefDelegate)Marshal.GetDelegateForFunctionPointer(_unknownVTable->AddRef, typeof(AddRefDelegate));
+            addRef(Self);
+            _library.AddRef();
+        }
+
+        internal CallableCOMWrapper(RefCountedFreeLibrary library, ref Guid desiredInterface, IntPtr pUnknown)
+        {
+            _library = library;
+            _library.AddRef();
+            
             IUnknownVTable* tbl = *(IUnknownVTable**)pUnknown;
 
             var queryInterface = (QueryInterfaceDelegate)Marshal.GetDelegateForFunctionPointer(tbl->QueryInterface, typeof(QueryInterfaceDelegate));
@@ -39,7 +51,6 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
 
             Self = pCorrectUnknown;
             _unknownVTable = *(IUnknownVTable**)pCorrectUnknown;
-            _library = GCHandle.Alloc(library);
         }
 
         public void Release()
@@ -48,7 +59,7 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
                 _release = (ReleaseDelegate)Marshal.GetDelegateForFunctionPointer(_unknownVTable->Release, typeof(ReleaseDelegate));
 
             _release(Self);
-            _library.Free();
+            _library.Release();
         }
 
         public IntPtr QueryInterface(ref Guid riid)
@@ -81,7 +92,6 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
             if (!_disposed)
             {
                 Release();
-                Interlocked.Decrement(ref _totalInstances);
                 _disposed = true;
             }
         }

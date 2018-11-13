@@ -19,9 +19,13 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
         private readonly DacLibrary _library;
 
         public SOSDac(DacLibrary library, IntPtr ptr)
-            : base(library, ref IID_ISOSDac, ptr)
+            : base(library.OwningLibrary, ref IID_ISOSDac, ptr)
         {
             _library = library;
+        }
+
+        public SOSDac(CallableCOMWrapper toClone) : base(toClone)
+        {
         }
 
         const int CharBufferSize = 256;
@@ -572,6 +576,10 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
             InitDelegate(ref _getThreadData, VTable->GetThreadData);
 
             int hr = _getThreadData(Self, address, out data);
+
+            if (IntPtr.Size == 4)
+                data = new ThreadData(ref data);
+
             return SUCCEEDED(hr);
         }
 
@@ -586,6 +594,8 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
         {
             InitDelegate(ref _getSegmentData, VTable->GetHeapSegmentData);
             int hr = _getSegmentData(Self, addr, out data);
+            if (hr == 0 && IntPtr.Size == 4)
+                data = new SegmentData(ref data);
             return SUCCEEDED(hr);
         }
 
@@ -602,6 +612,10 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
         {
             InitDelegate(ref _getGCHeapDetails, VTable->GetGCHeapDetails);
             int hr = _getGCHeapDetails(Self, addr, out data);
+
+            if (IntPtr.Size == 4)
+                data = new HeapDetails(ref data);
+
             return SUCCEEDED(hr);
         }
 
@@ -609,6 +623,9 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
         {
             InitDelegate(ref _getGCHeapStaticData, VTable->GetGCHeapStaticData);
             int hr = _getGCHeapStaticData(Self, out data);
+
+            if (IntPtr.Size == 4)
+                data = new HeapDetails(ref data);
             return SUCCEEDED(hr);
         }
         
