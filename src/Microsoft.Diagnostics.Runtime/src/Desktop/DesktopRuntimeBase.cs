@@ -36,7 +36,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         private Dictionary<string, DesktopModule> _moduleFiles = new Dictionary<string, DesktopModule>();
         private Lazy<ClrModule> _mscorlib;
 
-        internal DesktopRuntimeBase(ClrInfo info, DataTargetImpl dt, DacLibrary lib)
+        internal DesktopRuntimeBase(ClrInfo info, DataTarget dt, DacLibrary lib)
             : base(info, dt, lib)
         {
             _heap = new Lazy<DesktopGCHeap>(CreateHeap);
@@ -746,7 +746,10 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                         ReadPointer(sp, out frameVtbl);
                     }
 
-                    DesktopStackFrame frame = GetStackFrame(thread, ip, sp, frameVtbl);
+                    byte[] contextCopy = new byte[context.Length];
+                    Buffer.BlockCopy(context, 0, contextCopy, 0, context.Length);
+
+                    DesktopStackFrame frame = GetStackFrame(thread, contextCopy, ip, sp, frameVtbl);
                     yield return frame;
                 } while (stackwalk.Next());
             }
@@ -807,18 +810,18 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
         internal abstract IObjectData GetObjectData(ulong objRef);
         internal abstract ulong GetMethodTableByEEClass(ulong eeclass);
         internal abstract IList<MethodTableTokenPair> GetMethodTableList(ulong module);
-        internal abstract IDomainLocalModuleData GetDomainLocalModule(ulong appDomain, ulong id);
+        internal abstract IDomainLocalModuleData GetDomainLocalModuleById(ulong appDomain, ulong id);
         internal abstract ICCWData GetCCWData(ulong ccw);
         internal abstract IRCWData GetRCWData(ulong rcw);
         internal abstract COMInterfacePointerData[] GetCCWInterfaces(ulong ccw, int count);
         internal abstract COMInterfacePointerData[] GetRCWInterfaces(ulong rcw, int count);
         internal abstract ulong GetThreadStaticPointer(ulong thread, ClrElementType type, uint offset, uint moduleId, bool shared);
-        internal abstract IDomainLocalModuleData GetDomainLocalModule(ulong module);
+        internal abstract IDomainLocalModuleData GetDomainLocalModule(ulong appDomain, ulong module);
         internal abstract IList<ulong> GetMethodDescList(ulong methodTable);
         internal abstract string GetNameForMD(ulong md);
         internal abstract IMethodDescData GetMethodDescData(ulong md);
         internal abstract uint GetMetadataToken(ulong mt);
-        protected abstract DesktopStackFrame GetStackFrame(DesktopThread thread, ulong ip, ulong sp, ulong frameVtbl);
+        protected abstract DesktopStackFrame GetStackFrame(DesktopThread thread, byte[] context, ulong ip, ulong sp, ulong frameVtbl);
         internal abstract IList<ClrStackFrame> GetExceptionStackTrace(ulong obj, ClrType type);
         internal abstract string GetAssemblyName(ulong assembly);
         internal abstract string GetAppBase(ulong appDomain);

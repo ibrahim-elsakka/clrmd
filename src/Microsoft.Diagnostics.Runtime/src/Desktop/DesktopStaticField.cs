@@ -70,7 +70,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                             res = sigParser.PeekElemType(out etype);
                             type = (ClrElementType)etype;
 
-                            if (ClrRuntime.IsObjectReference(type))
+                            if (type.IsObjectReference())
                                 _type = (BaseDesktopHeapType)heap.GetBasicType(ClrElementType.SZArray);
                             else
                                 _type = heap.GetArrayType(type, -1, null);
@@ -143,7 +143,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             ClrType[] types = new ClrType[domains.Count];
 
             ClrElementType elType = ElementType;
-            if (ClrRuntime.IsPrimitive(elType) || elType == ClrElementType.String)
+            if (elType.IsPrimitive() || elType == ClrElementType.String)
                 return ((DesktopGCHeap)heap).GetBasicType(elType);
 
             int count = 0;
@@ -250,7 +250,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             if (shared)
             {
                 ulong id = _containingType.DesktopModule.ModuleId;
-                data = _containingType.DesktopHeap.DesktopRuntime.GetDomainLocalModule(appDomain.Address, id);
+                data = _containingType.DesktopHeap.DesktopRuntime.GetDomainLocalModuleById(appDomain.Address, id);
                 if (!IsInitialized(data))
                     return 0;
             }
@@ -258,14 +258,14 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
             {
                 ulong modAddr = _containingType.GetModuleAddress(appDomain);
                 if (modAddr != 0)
-                    data = _containingType.DesktopHeap.DesktopRuntime.GetDomainLocalModule(modAddr);
+                    data = _containingType.DesktopHeap.DesktopRuntime.GetDomainLocalModule(appDomain.Address, modAddr);
             }
 
             if (data == null)
                 return 0;
 
             ulong addr;
-            if (ClrRuntime.IsPrimitive(ElementType))
+            if (ElementType.IsPrimitive())
                 addr = data.NonGCStaticDataStart + _field.Offset;
             else
                 addr = data.GCStaticDataStart + _field.Offset;
@@ -282,7 +282,7 @@ namespace Microsoft.Diagnostics.Runtime.Desktop
                 return true;
 
             ulong id = _containingType.DesktopModule.ModuleId;
-            IDomainLocalModuleData data = _containingType.DesktopHeap.DesktopRuntime.GetDomainLocalModule(appDomain.Address, id);
+            IDomainLocalModuleData data = _containingType.DesktopHeap.DesktopRuntime.GetDomainLocalModuleById(appDomain.Address, id);
             if (data == null)
                 return false;
 

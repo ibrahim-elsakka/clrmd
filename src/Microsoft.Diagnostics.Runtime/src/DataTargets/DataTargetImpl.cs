@@ -146,6 +146,8 @@ namespace Microsoft.Diagnostics.Runtime
                     Version = module.Version
                 };
 
+                module.IsRuntime = true; //strange logic here (originally from the ClrInfo constructor)
+
                 versions.Add(new ClrInfo(this, flavor, module, dacInfo, dacLocation));
             }
 
@@ -163,7 +165,7 @@ namespace Microsoft.Diagnostics.Runtime
                 library.Dispose();
         }
 
-        internal override void AddDacLibrary(DacLibrary dacLibrary)
+        protected internal override void AddDacLibrary(DacLibrary dacLibrary)
         {
             _dacLibraries.Add(dacLibrary);
         }

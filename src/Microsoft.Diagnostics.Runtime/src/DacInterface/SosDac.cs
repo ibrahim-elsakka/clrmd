@@ -352,7 +352,7 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
             {
                 return new MetaDataImport(_library, iunk);
             }
-            catch (InvalidOperationException)
+            catch (InvalidCastException)
             {
                 // QueryInterface on MetaDataImport seems to fail when we don't have full
                 // metadata available.
