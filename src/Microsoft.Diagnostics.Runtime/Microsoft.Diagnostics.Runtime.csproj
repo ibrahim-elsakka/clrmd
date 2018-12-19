@@ -6,11 +6,11 @@
     <SignAssembly>True</SignAssembly>
     <AssemblyOriginatorKeyFile>$(MSBuildThisFileDirectory)\..\..\eng\Microsoft.Diagnostics.Runtime.snk</AssemblyOriginatorKeyFile>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>;1591;1701</NoWarn>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <DefineConstants Condition=" '$(IsDotNetFramework)' == 'true' ">$(DefineConstants);NET45</DefineConstants>
     <CheckForOverflowUnderflow>false</CheckForOverflowUnderflow>
-    <NoWarn>;1591;1701</NoWarn>
   </PropertyGroup>
 
 </Project>

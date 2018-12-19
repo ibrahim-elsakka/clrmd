@@ -10,7 +10,7 @@ using System.Runtime.InteropServices;
 using Microsoft.Diagnostics.Runtime.ICorDebug;
 using Microsoft.Diagnostics.Runtime.Interop;
 using Microsoft.Diagnostics.Runtime.Utilities;
-using IMAGE_DATA_DIRECTORY = Microsoft.Diagnostics.Runtime.Utilities.IMAGE_DATA_DIRECTORY;
+using IMAGE_DATA_DIRECTORY = Microsoft.Diagnostics.Runtime.Interop.IMAGE_DATA_DIRECTORY;
 
 namespace Microsoft.Diagnostics.Runtime.DacInterface
 {
@@ -163,26 +163,13 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
                 }
 
                 // We do not put a using statement here to prevent needing to load/unload the binary over and over.
-                PEFile file = _dataTarget.FileLoader.LoadPEFile(filePath);
-                if (file?.Header != null)
+                PEImage peimage = _dataTarget.FileLoader.LoadPEImage(filePath);
+                if (peimage != null)
                 {
-                    PEBuffer peBuffer = file.AllocBuff();
-
+                    Debug.Assert(peimage.IsValid);
                     int rva = checked((int)(address - info.ImageBase));
-
-                    if (file.Header.TryGetFileOffsetFromRva(rva, out rva))
-                    {
-                        byte* dst = (byte*)buffer.ToPointer();
-                        byte* src = peBuffer.Fetch(rva, bytesRequested);
-
-                        for (int i = 0; i < bytesRequested; i++)
-                            dst[i] = src[i];
-
-                        bytesRead = bytesRequested;
-                        return S_OK;
-                    }
-
-                    file.FreeBuff(peBuffer);
+                    bytesRead = peimage.Read(buffer, rva, bytesRequested);
+                    return S_OK;
                 }
             }
 
@@ -271,7 +258,7 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
             return E_NOTIMPL;
         }
 
-        public int GetMetadata(
+        public unsafe int GetMetadata(
             IntPtr self,
             string filename,
             uint imageTimestamp,
@@ -280,42 +267,42 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
             uint mdRva,
             uint flags,
             uint bufferSize,
-            byte[] buffer,
-            IntPtr dataSize)
+            IntPtr buffer,
+            int* pDataSize)
         {
+            if (buffer == null)
+                return E_INVALIDARG;
+
             string filePath = _dataTarget.SymbolLocator.FindBinary(filename, imageTimestamp, imageSize, true);
             if (filePath == null)
                 return E_FAIL;
 
             // We do not put a using statement here to prevent needing to load/unload the binary over and over.
-            PEFile file = _dataTarget.FileLoader.LoadPEFile(filePath);
-            if (file == null)
+            PEImage peimage = _dataTarget.FileLoader.LoadPEImage(filePath);
+            if (peimage == null)
                 return E_FAIL;
 
-            IMAGE_DATA_DIRECTORY comDescriptor = file.Header.ComDescriptorDirectory;
-            if (comDescriptor.VirtualAddress == 0)
-                return E_FAIL;
+            Debug.Assert(peimage.IsValid);
 
-            PEBuffer peBuffer = file.AllocBuff();
-            if (mdRva == 0)
+            uint rva = mdRva;
+            uint size = bufferSize;
+            if (rva == 0)
             {
-                IntPtr hdr = file.SafeFetchRVA(comDescriptor.VirtualAddress, comDescriptor.Size, peBuffer);
-
-                IMAGE_COR20_HEADER corhdr = (IMAGE_COR20_HEADER)Marshal.PtrToStructure(hdr, typeof(IMAGE_COR20_HEADER));
-                if (bufferSize < corhdr.MetaData.Size)
-                {
-                    file.FreeBuff(peBuffer);
+                IMAGE_DATA_DIRECTORY comDescriptor = peimage.OptionalHeader.ComDescriptorDirectory;
+                if (comDescriptor.VirtualAddress == 0)
                     return E_FAIL;
-                }
 
-                mdRva = corhdr.MetaData.VirtualAddress;
-                bufferSize = corhdr.MetaData.Size;
+                rva = comDescriptor.VirtualAddress;
+                size = Math.Min(bufferSize, comDescriptor.Size);
             }
 
-            IntPtr ptr = file.SafeFetchRVA((int)mdRva, (int)bufferSize, peBuffer);
-            Marshal.Copy(ptr, buffer, 0, (int)bufferSize);
-
-            file.FreeBuff(peBuffer);
+            checked
+            {
+                int read = peimage.Read(buffer, (int)rva, (int)size);
+                if (pDataSize != null)
+                    *pDataSize = read;
+            }
+            
             return S_OK;
         }
 
@@ -363,8 +350,8 @@ namespace Microsoft.Diagnostics.Runtime.DacInterface
             uint mdRva,
             uint flags,
             uint bufferSize,
-            byte[] buffer,
-            IntPtr dataSize);
+            IntPtr buffer,
+            int* dataSize);
 
         [UnmanagedFunctionPointer(CallingConvention.StdCall)]
         private delegate int GetMachineTypeDelegate(IntPtr self, out IMAGE_FILE_MACHINE machineType);
